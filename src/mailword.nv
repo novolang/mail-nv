@@ -1,0 +1,274 @@
+// mailword.nv — the encoded words of RFC 2047 and the parameter
+// continuations of RFC 2231: the two ways a header carries text that
+// is not US-ASCII.
+//
+// A HEADER IS ASCII, SO NON-ASCII TEXT IS SMUGGLED
+//
+// RFC 5322 § 2.2 allows a header field to hold US-ASCII and nothing
+// else.  Two mechanisms were added on top, and a mail parser needs
+// both because they are used in different places.
+//
+// RFC 2047 § 2's ENCODED WORD is `=?charset?encoding?text?=`, and it
+// appears in display names, in `Subject:` and in any other unstructured
+// field.  The encoding is `Q` — quoted-printable with `_` for a space —
+// or `B`, which is base64.  A word may be at most 75 octets long, so
+// long text is several adjacent words, and the whitespace BETWEEN two
+// adjacent encoded words is dropped on decoding.  That last rule is
+// the one every implementation gets wrong first: it is what lets a
+// Japanese subject line wrap without gaining spaces.
+//
+// RFC 2231 § 3's PARAMETER CONTINUATION is for `Content-Type` and
+// `Content-Disposition` parameters, where an encoded word is NOT
+// allowed, because the parameter grammar is structured.  Instead the
+// name gains a section number and an optional `*`:
+// `filename*0*=UTF-8''%E2%82%AC`, `filename*1*=uro.txt`.  A caller
+// never wants to see that, so `mailctype` hands back the assembled
+// value and this module is where the assembly lives.
+//
+// WHAT THIS PACKAGE DOES ABOUT CHARACTER SETS
+//
+// It decodes the three sets that carry essentially all of modern mail —
+// `us-ascii`, `iso-8859-1` and `utf-8` — and refuses the rest with
+// `MailUnknownCharset`, naming what it saw.  A refusal here is not a
+// malformed message: the bytes are intact and reachable, and
+// `mailerror.is_unrenderable` is the function that says so.  A full
+// character set table is a different package's job.
+
+use mailerror
+
+// The two encodings an encoded word may use, RFC 2047 § 4.
+//
+// ```novo
+// use mailword
+//
+// fn main() [io]
+//     println(mailword.encoding_name(MailQEncoding))    // Q
+// ```
+pub enum MailWordEncoding
+    // `Q`, a quoted-printable variant in which `_` means a space and
+    // `?`, `_` and `=` must be encoded.  RFC 2047 § 4.2.
+    MailQEncoding
+    // `B`, base64 as RFC 2045 § 6.8 defines it.  RFC 2047 § 4.1.
+    MailBEncoding
+
+// A character set this package converts.
+//
+// ```novo
+// use mailword
+//
+// fn main() [io]
+//     println(mailword.charset_name(MailUtf8))          // utf-8
+// ```
+pub enum MailCharset
+    // `us-ascii`, RFC 2046 § 4.1.2's default.
+    MailUsAscii
+    // `iso-8859-1`, which decades of European mail is written in.
+    MailLatin1
+    // `utf-8`, RFC 3629.
+    MailUtf8
+
+// One encoded word, taken apart.
+//
+// ```novo
+// use mailword
+//
+// fn main() [io]
+//     match mailword.parse_word("=?utf-8?Q?Caf=C3=A9?=")
+//         Ok(w)  => println(mailword.charset_name(w.charset))
+//         Err(e) => println(e.message())
+// ```
+pub struct MailEncodedWord
+    // The character set the text is in, once decoded.
+    charset: MailCharset
+    // The language tag RFC 2231 § 5 allows after the charset
+    // (`=?utf-8*de?Q?...?=`), or `""`.  Carried rather than dropped so
+    // a renderer can set the language of the text it shows.
+    language: Str
+    // Which of the two encodings the octets use.
+    encoding: MailWordEncoding
+    // The octets between the third and fourth `?`, undecoded.
+    encoded_text: Str
+
+// The name a `MailWordEncoding` is written with: `"Q"` or `"B"`.
+//
+// ```novo
+// use mailword
+//
+// fn main() [io]
+//     println(mailword.encoding_name(MailBEncoding))     // B
+// ```
+pub fn encoding_name(e: MailWordEncoding) -> Str
+    todo("mail-nv.mailword.encoding_name")
+
+// The canonical lowercase name of a character set: `"us-ascii"`,
+// `"iso-8859-1"`, `"utf-8"`.
+//
+// ```novo
+// use mailword
+//
+// fn main() [io]
+//     println(mailword.charset_name(MailLatin1))         // iso-8859-1
+// ```
+pub fn charset_name(c: MailCharset) -> Str
+    todo("mail-nv.mailword.charset_name")
+
+// The character set a name denotes, or `None`.
+//
+// Matched case-insensitively, and the registered aliases are accepted:
+// `ascii`, `latin1`, `iso_8859-1`, `utf8`.  `None` for every set this
+// package does not convert, which is what becomes
+// `MailUnknownCharset`.
+//
+// ```novo
+// use mailword
+//
+// fn main() [io]
+//     match mailword.charset_named("UTF-8")
+//         Some(_) => println("known")
+//         None    => println("not converted here")
+// ```
+pub fn charset_named(name: Str) -> ?MailCharset
+    todo("mail-nv.mailword.charset_named")
+
+// One encoded word taken apart, without decoding its text.
+//
+// `MailBadEncodedWord` when the string is not
+// `=?charset?encoding?text?=`, and `MailUnknownCharset` when the
+// charset is not one of the three.
+//
+// ```novo
+// use mailword
+//
+// fn main() [io]
+//     match mailword.parse_word("=?ISO-8859-1?Q?a?=")
+//         Ok(w)  => println(w.encoded_text)              // a
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_word(text: Str) -> Result<MailEncodedWord, mailerror.MailError>
+    todo("mail-nv.mailword.parse_word")
+
+// A whole header value decoded: every encoded word in it replaced by
+// its text, and the whitespace between two ADJACENT encoded words
+// dropped.
+//
+// RFC 2047 § 6.2 requires dropping that whitespace, and it is what
+// lets a long subject be split across several words without gaining
+// spaces when it is put back together.  Whitespace between an encoded
+// word and ordinary text is kept.
+//
+// ```novo
+// use mailword
+//
+// fn main() [io]
+//     match mailword.decode_text("=?utf-8?B?SGVsbG8=?= there")
+//         Ok(s)  => println(s)                           // Hello there
+//         Err(e) => println(e.message())
+// ```
+pub fn decode_text(value: Str) -> Result<Str, mailerror.MailError>
+    todo("mail-nv.mailword.decode_text")
+
+// A `phrase` decoded — a display name, where RFC 2047 § 5 allows an
+// encoded word only where an `atom` is allowed.
+//
+// Separate from `decode_text` because the two contexts have different
+// rules: an encoded word inside a quoted string is NOT an encoded
+// word, it is literal text, and a decoder that did not know which
+// context it was in would rewrite a display name that legitimately
+// contained `=?`.
+//
+// ```novo
+// use mailword
+//
+// fn main() [io]
+//     match mailword.decode_phrase("=?utf-8?Q?Ada_Lovelace?=")
+//         Ok(s)  => println(s)                           // Ada Lovelace
+//         Err(e) => println(e.message())
+// ```
+pub fn decode_phrase(value: Str) -> Result<Str, mailerror.MailError>
+    todo("mail-nv.mailword.decode_phrase")
+
+// Whether a string needs encoding at all: true when it holds an octet
+// outside printable US-ASCII, or a line longer than the header limit.
+//
+// A builder asks this first, because text that does not need encoding
+// must be emitted as it stands — an ASCII subject wrapped in an
+// encoded word is legal and makes every mail client show a message
+// nobody can search.
+//
+// ```novo
+// use mailword
+//
+// fn main() [io]
+//     println("${mailword.needs_encoding("plain ascii")}")   // false
+// ```
+pub fn needs_encoding(text: Str) -> Bool
+    todo("mail-nv.mailword.needs_encoding")
+
+// Text encoded as one or more encoded words, each at most the 75
+// octets RFC 2047 § 2 allows, joined by a space and a fold.
+//
+// The encoding is chosen per word: `Q` when most of the octets are
+// ASCII, because the result stays readable in a raw message, and `B`
+// otherwise, because it is shorter.  A word is never split in the
+// middle of a multi-octet UTF-8 character, which RFC 2047 § 5 requires
+// and which is the rule that produces replacement characters when it
+// is broken.
+//
+// ```novo
+// use mailword
+//
+// fn main() [io]
+//     println(mailword.encode_text("Caf\u{e9}", MailUtf8))
+// ```
+pub fn encode_text(text: Str, charset: MailCharset) -> Str
+    todo("mail-nv.mailword.encode_text")
+
+// Text encoded as a single word in the encoding the caller names.
+//
+// The low-level form, for a caller reproducing a specific message —
+// a test vector, a signature over a header that must be rebuilt octet
+// for octet.  `encode_text` is what a builder wants.
+//
+// ```novo
+// use mailword
+//
+// fn main() [io]
+//     println(mailword.encode_word("Ada", MailUtf8, MailQEncoding))
+// ```
+pub fn encode_word(text: Str, charset: MailCharset, encoding: MailWordEncoding) -> Str
+    todo("mail-nv.mailword.encode_word")
+
+// An RFC 2231 § 3 parameter value assembled from its sections.
+//
+// The sections arrive as `(name, value)` pairs exactly as they were
+// written — `filename*0*`, `filename*1` — and this returns the
+// assembled, percent-decoded, charset-converted value.
+// `MailBadParameterContinuation` when a section is missing, repeated,
+// or the extended and plain forms are mixed for one name.
+//
+// ```novo
+// use mailword
+//
+// fn main() [io]
+//     match mailword.assemble_parameter("filename", [("filename*0*", "utf-8''a"), ("filename*1", "b")])
+//         Ok(s)  => println(s)                           // ab
+//         Err(e) => println(e.message())
+// ```
+pub fn assemble_parameter(name: Str, sections: [(Str, Str)]) -> Result<Str, mailerror.MailError>
+    todo("mail-nv.mailword.assemble_parameter")
+
+// A parameter value split into the RFC 2231 sections that carry it.
+//
+// The inverse of `assemble_parameter`.  A value that is plain ASCII
+// and fits on one line comes back as one pair with the name unchanged,
+// because a receiver that does not implement RFC 2231 must still be
+// able to read the ordinary case.
+//
+// ```novo
+// use mailword
+//
+// fn main() [io]
+//     println("${list.len(mailword.split_parameter("filename", "report.pdf", MailUsAscii))}")
+// ```
+pub fn split_parameter(name: Str, value: Str, charset: MailCharset) -> [(Str, Str)]
+    todo("mail-nv.mailword.split_parameter")

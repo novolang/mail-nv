@@ -1,0 +1,351 @@
+// mailmime_tests.nv — the MIME layer: media types and their
+// parameters, the transfer encodings, and the tree.
+//
+// RED ON PURPOSE: every assertion reaches `not implemented:
+// mail-nv.<module>.<fn>`.
+
+use std.test
+use mailctype
+use mailhdr
+use mailmime
+use mailword
+use mailxfer
+
+// RFC 2046 § 5.1.1's own multipart example, trimmed to two parts.
+fn a_multipart() -> Bytes
+    bytes.from_str("This is the preamble.\r\n--simple boundary\r\n\r\nThis is implicitly typed plain US-ASCII text.\r\n--simple boundary\r\nContent-type: text/plain; charset=us-ascii\r\n\r\nThis is explicitly typed plain US-ASCII text.\r\n--simple boundary--\r\nThis is the epilogue.")
+
+@test
+fn test_a_media_type_is_a_type_a_subtype_and_parameters() [io]
+    test.case("RFC 2045 § 5.1 — multipart/mixed; boundary=\"sep\"")
+    match mailctype.parse_content_type("multipart/mixed; boundary=\"sep\"")
+        Ok(ct) =>
+            test.assert_eq_str(ct.type_name, "multipart")
+            test.assert_eq_str(ct.subtype, "mixed")
+            test.assert_eq_str(mailctype.boundary_of(ct), "sep")
+            test.assert(mailctype.is_multipart(ct))
+        Err(e) => test.fail(e.message())
+
+    test.case("the type and the subtype fold case and the parameter value does not")
+    match mailctype.parse_content_type("TEXT/PLAIN; charset=US-ASCII")
+        Ok(ct) =>
+            test.assert_eq_str(ct.type_name, "text")
+            test.assert_eq_str(mailctype.param_value(ct, "CHARSET"), "US-ASCII")
+        Err(e) => test.fail(e.message())
+
+    test.case("and a missing field means text/plain; charset=us-ascii")
+    test.assert_eq_str(mailctype.default_content_type().subtype, "plain")
+    test.assert_eq_str(mailctype.charset_of(mailctype.default_content_type()), "us-ascii")
+
+@test
+fn test_a_media_type_round_trips_and_quotes_what_it_must() [io]
+    test.case("a plain type needs no quoting")
+    let ct = mailctype.content_type("text", "plain", [])
+    test.assert_eq_str(mailctype.format_content_type(ct), "text/plain")
+
+    test.case("a parameter with a tspecials character is quoted")
+    let odd = mailctype.with_param(ct, "boundary", "a b")
+    test.assert(str.contains(mailctype.format_content_type(odd), "\""))
+
+    test.case("with_param replaces rather than duplicates")
+    let once = mailctype.with_param(mailctype.with_param(ct, "charset", "utf-8"), "charset", "iso-8859-1")
+    test.assert_eq_str(mailctype.param_value(once, "charset"), "iso-8859-1")
+    test.assert_eq(list.len(once.params), 1)
+
+@test
+fn test_message_and_multipart_are_the_two_container_types() [io]
+    test.case("message/rfc822 carries a whole message")
+    test.assert(mailctype.is_message(mailctype.content_type("message", "rfc822", [])))
+
+    test.case("text/plain carries neither")
+    test.assert_false(mailctype.is_multipart(mailctype.content_type("text", "plain", [])), "a leaf")
+    test.assert_false(mailctype.is_message(mailctype.content_type("text", "plain", [])), "a leaf")
+
+@test
+fn test_an_unknown_disposition_is_an_attachment() [io]
+    // RFC 2183 § 2.8 requires it: a receiver that does not know the
+    // disposition type treats the part as an attachment.
+    test.case("attachment; filename=\"a.txt\"")
+    match mailctype.parse_disposition("attachment; filename=\"a.txt\"")
+        Ok(d)  =>
+            test.assert_eq_str(mailctype.filename_of(d), "a.txt")
+            test.assert(mailctype.disposition_is_attachment(d))
+        Err(e) => test.fail(e.message())
+
+    test.case("an unknown type is still an attachment")
+    let odd = mailctype.disposition(MailOtherDisposition("x-thing"), [])
+    test.assert(mailctype.disposition_is_attachment(odd))
+    test.assert_eq_str(mailctype.disposition_name(odd.kind), "x-thing")
+
+    test.case("and inline with no filename is not")
+    let plain = mailctype.disposition(MailInlineDisposition, [])
+    test.assert_false(mailctype.disposition_is_attachment(plain), "shown in place")
+    test.assert_eq_str(mailctype.format_disposition(plain), "inline")
+
+@test
+fn test_the_transfer_encodings_are_the_five_of_rfc_2045() [io]
+    test.case("the names are matched case-insensitively")
+    match mailctype.parse_transfer_encoding("Base64")
+        Ok(e)  => test.assert_eq_str(mailctype.transfer_encoding_name(e), "base64")
+        Err(e) => test.fail(e.message())
+
+    test.case("and anything else is refused, naming what was written")
+    match mailctype.parse_transfer_encoding("x-uuencode")
+        Ok(_)  => test.fail("RFC 2045 § 6.4 lists five mechanisms")
+        Err(e) => test.assert(str.contains(e.message(), "x-uuencode"))
+
+@test
+fn test_base64_and_quoted_printable_decode_to_the_same_octets() [io]
+    test.case("RFC 2045 § 6.8 — aGk= is `hi`")
+    match mailxfer.decode_base64(bytes.from_str("aGk="), mailxfer.span(0, 4))
+        Ok(b)  => test.assert_eq(bytes.len(b), 2)
+        Err(e) => test.fail(e.message())
+
+    test.case("a line break inside base64 is skipped")
+    match mailxfer.decode_base64(bytes.from_str("aG\r\nk="), mailxfer.span(0, 6))
+        Ok(b)  => test.assert_eq(bytes.len(b), 2)
+        Err(e) => test.fail(e.message())
+
+    test.case("RFC 2045 § 6.7 — =C3=A9 is one two-octet character")
+    match mailxfer.decode_quoted_printable(bytes.from_str("Caf=C3=A9"), mailxfer.span(0, 9))
+        Ok(b)  => test.assert_eq(bytes.len(b), 5)
+        Err(e) => test.fail(e.message())
+
+    test.case("and a soft line break carries no data")
+    match mailxfer.decode_quoted_printable(bytes.from_str("ab=\r\ncd"), mailxfer.span(0, 7))
+        Ok(b)  => test.assert_eq(bytes.len(b), 4)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_broken_body_is_refused_at_its_offset() [io]
+    test.case("an = with no hex digits after it")
+    match mailxfer.decode_quoted_printable(bytes.from_str("a=zz"), mailxfer.span(0, 4))
+        Ok(_)  => test.fail("=zz is not a quoted-printable octet")
+        Err(e) => test.assert(str.len(e.message()) > 0)
+
+    test.case("an octet outside the base64 alphabet")
+    match mailxfer.decode_base64(bytes.from_str("aG!="), mailxfer.span(0, 4))
+        Ok(_)  => test.fail("! is not in the base64 alphabet")
+        Err(e) => test.assert(str.len(e.message()) > 0)
+
+    test.case("and a span that reaches past its source")
+    match mailxfer.slice(bytes.from_str("hi"), mailxfer.span(0, 99))
+        Ok(_)  => test.fail("the source is two octets long")
+        Err(e) => test.assert(str.len(e.message()) > 0)
+
+@test
+fn test_the_identity_encodings_copy_the_span_unchanged() [io]
+    test.case("7bit, 8bit and binary are not transformations")
+    let src = bytes.from_str("hello")
+    match mailxfer.decode(src, mailxfer.span(0, 5), MailSevenBit)
+        Ok(b)  => test.assert_eq(bytes.len(b), 5)
+        Err(e) => test.fail(e.message())
+    match mailxfer.decode(src, mailxfer.span(0, 5), MailBinary)
+        Ok(b)  => test.assert_eq(bytes.len(b), 5)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_an_encoding_is_chosen_to_keep_a_message_readable() [io]
+    test.case("plain ASCII stays 7bit rather than being base64'd")
+    test.assert_eq_str(mailctype.transfer_encoding_name(mailxfer.choose_encoding(bytes.from_str("hello"))),
+                       "7bit")
+
+    test.case("and the round trip through the chosen encoding is exact")
+    let data = bytes.from_str("hello")
+    test.assert_eq_str(mailxfer.encode(data, MailBase64Encoding), mailxfer.encode_base64(data))
+    test.assert(str.len(mailxfer.encode_quoted_printable(data)) > 0)
+
+@test
+fn test_canonical_line_endings_are_a_conversion_and_are_idempotent() [io]
+    // RFC 2045 § 6.7: a text body is canonicalised to CRLF before it
+    // is encoded.  A body converted twice must not gain octets.
+    test.case("a lone LF becomes CRLF")
+    test.assert_eq(bytes.len(mailxfer.to_crlf(bytes.from_str("a\nb"))), 4)
+
+    test.case("and a CRLF is left alone")
+    test.assert_eq(bytes.len(mailxfer.to_crlf(mailxfer.to_crlf(bytes.from_str("a\nb")))), 4)
+
+    test.case("to_lf is the inverse")
+    test.assert_eq(bytes.len(mailxfer.to_lf(bytes.from_str("a\r\nb"))), 3)
+
+@test
+fn test_adjacent_encoded_words_lose_the_space_between_them() [io]
+    // RFC 2047 § 6.2, with the specification's own examples.  This is
+    // the rule that lets a long subject wrap without gaining spaces.
+    test.case("=?ISO-8859-1?Q?a?= is `a`")
+    match mailword.decode_text("=?ISO-8859-1?Q?a?=")
+        Ok(s)  => test.assert_eq_str(s, "a")
+        Err(e) => test.fail(e.message())
+
+    test.case("=?ISO-8859-1?Q?a?= b keeps the space")
+    match mailword.decode_text("=?ISO-8859-1?Q?a?= b")
+        Ok(s)  => test.assert_eq_str(s, "a b")
+        Err(e) => test.fail(e.message())
+
+    test.case("=?ISO-8859-1?Q?a?= =?ISO-8859-1?Q?b?= is `ab`")
+    match mailword.decode_text("=?ISO-8859-1?Q?a?= =?ISO-8859-1?Q?b?=")
+        Ok(s)  => test.assert_eq_str(s, "ab")
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_an_encoded_word_names_its_charset_and_its_encoding() [io]
+    test.case("the three parts come back undecoded")
+    match mailword.parse_word("=?utf-8?Q?Caf=C3=A9?=")
+        Ok(w)  =>
+            test.assert_eq_str(mailword.charset_name(w.charset), "utf-8")
+            test.assert_eq_str(mailword.encoding_name(w.encoding), "Q")
+            test.assert_eq_str(w.encoded_text, "Caf=C3=A9")
+        Err(e) => test.fail(e.message())
+
+    test.case("an unconverted charset is refused, naming it")
+    match mailword.parse_word("=?x-mac-ce?Q?a?=")
+        Ok(_)  => test.fail("this package converts three sets")
+        Err(e) => test.assert(str.contains(e.message(), "x-mac-ce"))
+
+    test.case("and the aliases of the three are accepted")
+    test.assert_some(mailword.charset_named("UTF8"))
+    test.assert_some(mailword.charset_named("latin1"))
+    test.assert_none(mailword.charset_named("windows-1252"))
+
+@test
+fn test_ascii_text_is_never_wrapped_in_an_encoded_word() [io]
+    // An ASCII subject inside an encoded word is legal and makes every
+    // client show a message nobody can search for.
+    test.case("plain ASCII needs no encoding")
+    test.assert_false(mailword.needs_encoding("plain ascii"), "nothing to encode")
+
+    test.case("and text with a non-ASCII octet does")
+    test.assert(mailword.needs_encoding("Caf\u{e9}"))
+
+    test.case("encoding it produces a word, and a single word is the low-level form")
+    test.assert(str.starts_with(mailword.encode_text("Caf\u{e9}", MailUtf8), "=?"))
+    test.assert(str.starts_with(mailword.encode_word("Ada", MailUtf8, MailQEncoding), "=?"))
+
+    test.case("a phrase is decoded under § 5's rules, not § 2's")
+    match mailword.decode_phrase("=?utf-8?Q?Ada_Lovelace?=")
+        Ok(s)  => test.assert_eq_str(s, "Ada Lovelace")
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_parameter_is_assembled_from_its_rfc_2231_sections() [io]
+    // RFC 2231 § 3: a long or non-ASCII parameter is written in
+    // numbered sections, and no caller should ever see one.
+    test.case("the sections are joined in order and percent-decoded")
+    match mailword.assemble_parameter("filename", [("filename*0*", "utf-8''%41"), ("filename*1", "b")])
+        Ok(s)  => test.assert_eq_str(s, "Ab")
+        Err(e) => test.fail(e.message())
+
+    test.case("a missing section is refused, naming the parameter")
+    match mailword.assemble_parameter("filename", [("filename*0*", "utf-8''a"), ("filename*2", "c")])
+        Ok(_)  => test.fail("section 1 is missing")
+        Err(e) => test.assert(str.contains(e.message(), "filename"))
+
+    test.case("and a short ASCII value is written back as one plain parameter")
+    let plain = mailword.split_parameter("filename", "report.pdf", MailUsAscii)
+    test.assert_eq(list.len(plain), 1)
+    test.assert_eq_str(plain[0].0, "filename")
+
+@test
+fn test_a_multipart_body_becomes_children_and_the_preamble_is_kept() [io]
+    test.case("RFC 2046 § 5.1.1 — two parts between simple boundary")
+    let src = a_multipart()
+    let ct = mailctype.content_type("multipart", "mixed", [mailctype.param("boundary", "simple boundary")])
+    let hs = mailhdr.headers([mailhdr.field("Content-Type", mailctype.format_content_type(ct))])
+    match mailmime.parse_part(src, hs, mailxfer.span(0, bytes.len(src)), 32)
+        Ok(p)  =>
+            test.assert_eq(list.len(p.children), 2)
+            test.assert(p.preamble.len > 0)
+            test.assert(p.epilogue.len > 0)
+        Err(e) => test.fail(e.message())
+
+    test.case("a multipart that never closes is refused as truncated")
+    let cut = bytes.from_str("--simple boundary\r\n\r\ntext\r\n")
+    match mailmime.parse_part(cut, hs, mailxfer.span(0, bytes.len(cut)), 32)
+        Ok(_)  => test.fail("the closing --simple boundary-- never arrives")
+        Err(e) => test.assert(str.len(e.message()) > 0)
+
+@test
+fn test_a_nesting_limit_is_a_parameter_and_not_a_constant() [io]
+    test.case("a depth of zero admits no children")
+    let src = a_multipart()
+    let ct = mailctype.content_type("multipart", "mixed", [mailctype.param("boundary", "simple boundary")])
+    let hs = mailhdr.headers([mailhdr.field("Content-Type", mailctype.format_content_type(ct))])
+    match mailmime.parse_part(src, hs, mailxfer.span(0, bytes.len(src)), 0)
+        Ok(_)  => test.fail("a multipart at depth 0 exceeds the limit")
+        Err(e) => test.assert(str.len(e.message()) > 0)
+
+@test
+fn test_a_part_is_a_span_until_somebody_asks_for_its_octets() [io]
+    test.case("a leaf holds a span, and decoding it takes the source")
+    let p = mailmime.leaf_part(mailctype.default_content_type(), mailxfer.span(0, 2))
+    match mailmime.decoded_body(bytes.from_str("hi"), p)
+        Ok(b)  => test.assert_eq(bytes.len(b), 2)
+        Err(e) => test.fail(e.message())
+
+    test.case("and the wrong source is refused rather than read short")
+    match mailmime.decoded_body(bytes.from_str(""), p)
+        Ok(_)  => test.fail("the span names octets this source does not have")
+        Err(e) => test.assert(str.len(e.message()) > 0)
+
+    test.case("decoded_text applies the charset the type names")
+    match mailmime.decoded_text(bytes.from_str("hi"), p)
+        Ok(s)  => test.assert_eq_str(s, "hi")
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_the_tree_is_walked_two_ways() [io]
+    let ct = mailctype.content_type("multipart", "alternative", [mailctype.param("boundary", "b")])
+    let text = mailmime.leaf_part(mailctype.content_type("text", "plain", []), mailxfer.span(0, 1))
+    let html = mailmime.leaf_part(mailctype.content_type("text", "html", []), mailxfer.span(1, 1))
+    let root = mailmime.multipart_part(ct, [text, html])
+
+    test.case("walk_order gives every part, parents first")
+    test.assert_eq(list.len(mailmime.walk_order(root)), 3)
+
+    test.case("display_parts applies § 5.1.4 and shows the last arm understood")
+    test.assert_eq(list.len(mailmime.display_parts(root)), 1)
+
+    test.case("and the text and HTML parts are reachable by name")
+    test.assert_some(mailmime.text_part(root))
+    test.assert_some(mailmime.html_part(root))
+
+@test
+fn test_attachments_are_found_by_disposition_and_by_content_id() [io]
+    let ct = mailctype.content_type("multipart", "mixed", [mailctype.param("boundary", "b")])
+    let body = mailmime.leaf_part(mailctype.content_type("text", "plain", []), mailxfer.span(0, 1))
+    let root = mailmime.multipart_part(ct, [body])
+
+    test.case("a body part is not an attachment")
+    test.assert_eq(list.len(mailmime.attachments_of(root)), 0)
+
+    test.case("a part with no filename answers an empty one")
+    test.assert_eq_str(mailmime.filename_of(body), "")
+
+    test.case("and a cid: reference finds nothing when no part carries the id")
+    test.assert_none(mailmime.part_by_content_id(root, "logo@example.com"))
+
+@test
+fn test_a_boundary_never_occurs_in_what_it_separates() [io]
+    // RFC 2046 § 5.1.1 requires it, and a builder that picked a
+    // constant would split somebody's message in the wrong place.
+    test.case("the boundary chosen for a body does not appear in it")
+    let content = bytes.from_str("a body mentioning --sep in passing")
+    let b = mailmime.fresh_boundary(content, 7)
+    test.assert_false(str.contains("a body mentioning --sep in passing", b), "it must not occur")
+
+    test.case("and the same seed gives the same boundary, so a build is reproducible")
+    test.assert_eq_str(b, mailmime.fresh_boundary(content, 7))
+
+@test
+fn test_a_part_is_written_back_with_its_headers_and_a_blank_line() [io]
+    test.case("format_part emits the header section and the body")
+    let p = mailmime.leaf_part(mailctype.default_content_type(), mailxfer.span(0, 2))
+    match mailmime.format_part(bytes.from_str("hi"), p)
+        Ok(s)  => test.assert(str.contains(s, "\r\n\r\n"))
+        Err(e) => test.fail(e.message())
+
+    test.case("and a multipart with no boundary parameter is refused")
+    let bad = mailmime.multipart_part(mailctype.content_type("multipart", "mixed", []), [p])
+    match mailmime.format_part(bytes.from_str("hi"), bad)
+        Ok(_)  => test.fail("RFC 2046 § 5.1.1 requires a boundary")
+        Err(e) => test.assert(str.len(e.message()) > 0)

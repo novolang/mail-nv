@@ -1,0 +1,267 @@
+// mailaddr.nv — the addresses in a header field, as values.
+//
+// WHAT AN ADDRESS IS
+//
+// RFC 5322 § 3.4 calls the thing in a `From:` or a `To:` field an
+// `address`, and it is one of two shapes.  A `mailbox` is an optional
+// display name and an `addr-spec` — `Ada Lovelace <ada@example.com>`,
+// or the bare `ada@example.com`.  A `group` is a display name, a
+// colon, a list of mailboxes and a semicolon —
+// `Friends: ada@example.com, alan@example.com;` — and a group with an
+// empty list is legal, which is how a `Bcc:` field says "there were
+// recipients and you may not see them".
+//
+// So a field's value is a LIST OF ADDRESSES, each of which is a
+// mailbox or a group, and a group holds mailboxes.  The nesting stops
+// there: RFC 5322 does not allow a group inside a group.  That is why
+// `MailAddress` and `MailGroup` are two types rather than one
+// recursive one — the grammar is not recursive and a type that said it
+// was would be a type with an unreachable case.
+//
+// THE DISPLAY NAME IS DECODED TEXT
+//
+// A display name arrives as RFC 2047 encoded words when it is not
+// plain ASCII: `=?UTF-8?B?w4RwZmVs?=`.  `display_name` holds the
+// DECODED text, because every caller wants the name and none wants the
+// encoding.  The encoding is put back on the way out by
+// `format_address`, which chooses the shorter of the Q and B forms —
+// so a name that survives a round trip arrives identical, and a name
+// that needed encoding is encoded again rather than being emitted as
+// raw UTF-8 in a header.
+
+use mailerror
+
+// One mailbox: an optional display name and an address specification.
+//
+// The address specification is kept as its two halves rather than as
+// one string, because every question a caller asks is about one of
+// them — routing is the domain, a mailing list check is the local
+// part, and a comparison that folded the case of both would be wrong:
+// RFC 5321 § 2.4 makes the domain case-insensitive and leaves the
+// local part to the receiving host.
+//
+// ```novo
+// use mailaddr
+//
+// fn main() [io]
+//     let a = mailaddr.named_address("Ada Lovelace", "ada", "example.com")
+//     println(a.display_name)                     // Ada Lovelace
+// ```
+pub struct MailAddress
+    // The display name in decoded text, or `""` when the address had
+    // none.  Never carries encoded words.
+    display_name: Str
+    // The part before the `@`, exactly as written, with any quoting
+    // removed.  Case is preserved: RFC 5321 § 2.4 leaves its meaning
+    // to the receiving host, so folding it here would be this package
+    // deciding something that is not its to decide.
+    local_part: Str
+    // The part after the `@`, lowercased, with a domain literal kept
+    // in its brackets (`[192.0.2.1]`).  Lowercased because RFC 5321
+    // § 2.4 makes the domain case-insensitive.
+    domain: Str
+
+// A named list of mailboxes, RFC 5322 § 3.4's `group`.
+//
+// An empty `members` is legal and meaningful: `undisclosed-recipients:;`
+// is the conventional way a `To:` field says a message was sent to a
+// blind list.
+//
+// ```novo
+// use mailaddr
+//
+// fn main() [io]
+//     let g = mailaddr.group("Friends", [mailaddr.addr_spec("ada", "example.com")])
+//     println("${list.len(g.members)}")           // 1
+// ```
+pub struct MailGroup
+    // The group's display name, in decoded text.
+    display_name: Str
+    // The mailboxes in it, possibly none.
+    members: [MailAddress]
+
+// One entry in an address field: a mailbox or a group.
+//
+// ```novo
+// use mailaddr
+//
+// fn main() [io]
+//     match MailMailbox(mailaddr.addr_spec("ada", "example.com"))
+//         MailMailbox(m) => println(m.domain)     // example.com
+//         MailGroupOf(_) => println("a group")
+// ```
+pub enum MailEntry
+    // A single mailbox.
+    MailMailbox(mailbox: MailAddress)
+    // A named list of them.
+    MailGroupOf(group: MailGroup)
+
+// A bare address with no display name.
+//
+// ```novo
+// use mailaddr
+//
+// fn main() [io]
+//     println(mailaddr.format_address(mailaddr.addr_spec("ada", "example.com")))
+// ```
+pub fn addr_spec(local_part: Str, domain: Str) -> MailAddress
+    todo("mail-nv.mailaddr.addr_spec")
+
+// An address with a display name.
+//
+// The name is given as decoded text and encoded on the way out if it
+// needs it, so a caller never writes an encoded word by hand.
+//
+// ```novo
+// use mailaddr
+//
+// fn main() [io]
+//     println(mailaddr.format_address(mailaddr.named_address("Ada", "ada", "example.com")))
+// ```
+pub fn named_address(display_name: Str, local_part: Str, domain: Str) -> MailAddress
+    todo("mail-nv.mailaddr.named_address")
+
+// A group of mailboxes under a name.
+//
+// ```novo
+// use mailaddr
+//
+// fn main() [io]
+//     println(mailaddr.group("Undisclosed recipients", []).display_name)
+// ```
+pub fn group(display_name: Str, members: [MailAddress]) -> MailGroup
+    todo("mail-nv.mailaddr.group")
+
+// The address written back as `local@domain`, with the local part
+// quoted if the grammar needs it.
+//
+// RFC 5322 § 3.2.4 requires quoting when the local part holds anything
+// outside `atext` — a space, a `@`, a `"` — and the quoting is applied
+// here so a caller that built an address from a database never emits
+// an unparseable one.
+//
+// ```novo
+// use mailaddr
+//
+// fn main() [io]
+//     println(mailaddr.format_addr_spec(mailaddr.addr_spec("ada", "example.com")))
+// ```
+pub fn format_addr_spec(a: MailAddress) -> Str
+    todo("mail-nv.mailaddr.format_addr_spec")
+
+// The address written back as a `mailbox`: `Name <local@domain>`, or
+// just `local@domain` when there is no display name.
+//
+// The display name is encoded as an RFC 2047 word when it is not plain
+// ASCII, and quoted when it holds a `specials` character.
+//
+// ```novo
+// use mailaddr
+//
+// fn main() [io]
+//     println(mailaddr.format_address(mailaddr.named_address("Ada", "ada", "example.com")))
+// ```
+pub fn format_address(a: MailAddress) -> Str
+    todo("mail-nv.mailaddr.format_address")
+
+// A whole address field's value, written back, folded to fit the 78
+// octet line RFC 5322 § 2.1.1 recommends.
+//
+// Folding happens at the commas between addresses, never inside one,
+// because a fold inside an `addr-spec` is what breaks the receivers
+// that parse headers with a regular expression.
+//
+// ```novo
+// use mailaddr
+//
+// fn main() [io]
+//     let one = MailMailbox(mailaddr.addr_spec("ada", "example.com"))
+//     println(mailaddr.format_entries([one]))
+// ```
+pub fn format_entries(entries: [MailEntry]) -> Str
+    todo("mail-nv.mailaddr.format_entries")
+
+// One address parsed from the text of a field.
+//
+// `MailBadAddress` when the text is not a single `mailbox`, including
+// when it holds two of them — a caller that wanted a list wanted
+// `parse_entries`.
+//
+// ```novo
+// use mailaddr
+//
+// fn main() [io]
+//     match mailaddr.parse_address("Ada Lovelace <ada@example.com>")
+//         Ok(a)  => println(a.local_part)         // ada
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_address(text: Str) -> Result<MailAddress, mailerror.MailError>
+    todo("mail-nv.mailaddr.parse_address")
+
+// A whole address field's value parsed: mailboxes and groups, in the
+// order they were written.
+//
+// Comments in parentheses are removed, as RFC 5322 § 3.2.2 allows them
+// anywhere whitespace is allowed, and folding whitespace is unfolded
+// first.
+//
+// ```novo
+// use mailaddr
+//
+// fn main() [io]
+//     match mailaddr.parse_entries("ada@example.com, Friends: alan@example.com;")
+//         Ok(es) => println("${list.len(es)}")    // 2
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_entries(text: Str) -> Result<[MailEntry], mailerror.MailError>
+    todo("mail-nv.mailaddr.parse_entries")
+
+// Every mailbox in a list of entries, with the groups flattened.
+//
+// What a caller delivering a message wants: the recipients, without
+// caring which of them were written inside a group.
+//
+// ```novo
+// use mailaddr
+//
+// fn main() [io]
+//     let g = MailGroupOf(mailaddr.group("Friends", [mailaddr.addr_spec("ada", "example.com")]))
+//     println("${list.len(mailaddr.mailboxes_of([g]))}")    // 1
+// ```
+pub fn mailboxes_of(entries: [MailEntry]) -> [MailAddress]
+    todo("mail-nv.mailaddr.mailboxes_of")
+
+// Whether a string is a syntactically valid `addr-spec` (RFC 5322
+// § 3.4.1).
+//
+// Syntax only.  It says nothing about whether the domain exists or the
+// mailbox accepts mail, because neither question can be answered
+// without the network and this package has no effects.
+//
+// ```novo
+// use mailaddr
+//
+// fn main() [io]
+//     println("${mailaddr.is_valid_addr_spec("ada@example.com")}")   // true
+// ```
+pub fn is_valid_addr_spec(text: Str) -> Bool
+    todo("mail-nv.mailaddr.is_valid_addr_spec")
+
+// Whether two addresses denote the same mailbox under RFC 5321 § 2.4:
+// the domains compared case-insensitively, the local parts compared
+// exactly.
+//
+// The local part is compared exactly because only the receiving host
+// knows whether it folds case, and a library that guessed would merge
+// two different mailboxes on the hosts that do not.
+//
+// ```novo
+// use mailaddr
+//
+// fn main() [io]
+//     let a = mailaddr.addr_spec("Ada", "Example.COM")
+//     let b = mailaddr.addr_spec("Ada", "example.com")
+//     println("${mailaddr.same_mailbox(a, b)}")   // true
+// ```
+pub fn same_mailbox(a: MailAddress, b: MailAddress) -> Bool
+    todo("mail-nv.mailaddr.same_mailbox")

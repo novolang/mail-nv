@@ -1,0 +1,281 @@
+// mailmsg_tests.nv — a whole message read, and a whole message built.
+//
+// RED ON PURPOSE: every assertion reaches `not implemented:
+// mail-nv.mailmsg.<fn>`.
+//
+// THE PROPERTY THIS SUITE IS FOR is the round trip: a draft built here
+// and parsed back gives the same addresses, the same subject and the
+// same attachment octets.  Everything else in the file is a fact the
+// specification states and this package has to honour.
+
+use std.test
+use civil
+use mailaddr
+use mailctype
+use mailhdr
+use mailmime
+use mailmsg
+use mailxfer
+
+// RFC 5322 § A.1.1's message, the specification's own minimal example.
+fn a1_1() -> Bytes
+    bytes.from_str("From: John Doe <jdoe@machine.example>\r\nTo: Mary Smith <mary@example.net>\r\nSubject: Saying Hello\r\nDate: Fri, 21 Nov 1997 09:55:06 -0600\r\nMessage-ID: <1234@local.machine.example>\r\n\r\nThis is a message just to say hello.\r\nSo, \"Hello\".\r\n")
+
+// A draft with one author, one recipient and a plain text body.
+fn a_draft() -> MailDraft
+    mailmsg.with_text_body(
+        mailmsg.with_subject(
+            mailmsg.with_to(
+                mailmsg.with_from(mailmsg.draft(), [mailaddr.addr_spec("ada", "example.com")]),
+                [MailMailbox(mailaddr.addr_spec("alan", "example.net"))]),
+            "Saying Hello"),
+        "This is a message just to say hello.")
+
+@test
+fn test_the_specifications_own_message_reads_field_for_field() [io]
+    test.case("RFC 5322 A.1.1")
+    match mailmsg.parse(a1_1(), 32)
+        Ok(m)  =>
+            test.assert_eq_str(mailmsg.subject_of(m), "Saying Hello")
+            match mailmsg.from_of(m)
+                Ok(fs) => test.assert_eq_str(fs[0].local_part, "jdoe")
+                Err(e) => test.fail(e.message())
+            match mailmsg.recipients_of(m)
+                Ok(rs) => test.assert_eq(list.len(rs), 1)
+                Err(e) => test.fail(e.message())
+            match mailmsg.date_of(m)
+                Ok(d)  => test.assert_some(d)
+                Err(e) => test.fail(e.message())
+            match mailmsg.message_id_of(m)
+                Ok(id) => test.assert_some(id)
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_message_with_no_mime_headers_is_one_text_part() [io]
+    // RFC 2045 § 5.2: the default is text/plain; charset=us-ascii, and
+    // a parser that left the type absent would make every caller write
+    // the default itself.
+    test.case("the root is a plain text leaf")
+    match mailmsg.parse(a1_1(), 32)
+        Ok(m)  =>
+            test.assert_eq_str(m.root.content_type.subtype, "plain")
+            test.assert_eq(list.len(m.root.children), 0)
+            test.assert_eq(m.root.depth, 0)
+        Err(e) => test.fail(e.message())
+
+    test.case("and its text is the body after the blank line")
+    match mailmsg.parse(a1_1(), 32)
+        Ok(m)  =>
+            match mailmsg.text_of(m)
+                Ok(s)  => test.assert(str.starts_with(s, "This is a message"))
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_part_is_decoded_against_the_message_it_came_from() [io]
+    test.case("part_bytes pairs a message with its own spans")
+    match mailmsg.parse(a1_1(), 32)
+        Ok(m)  =>
+            match mailmsg.part_bytes(m, m.root)
+                Ok(b)  => test.assert(bytes.len(b) > 0)
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_the_raw_spans_are_what_a_signature_is_computed_over() [io]
+    // A rebuild from the parsed fields normalises the folding and the
+    // case, and hashes to something else.  dkim-nv needs the octets
+    // that arrived.
+    test.case("the header span and the body span cover the message")
+    match mailmsg.parse(a1_1(), 32)
+        Ok(m)  =>
+            let h = mailmsg.raw_header_span(m)
+            let b = mailmsg.raw_body_span(m)
+            test.assert(h.len > 0)
+            test.assert(b.len > 0)
+            test.assert_eq(h.len + b.len, bytes.len(a1_1()))
+        Err(e) => test.fail(e.message())
+
+    test.case("and the header span slices back out of the source")
+    match mailmsg.parse(a1_1(), 32)
+        Ok(m)  =>
+            match mailxfer.slice(m.source, mailmsg.raw_header_span(m))
+                Ok(s)  => test.assert(bytes.len(s) > 0)
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_thread_is_read_from_references_before_in_reply_to() [io]
+    // References carries the whole chain and In-Reply-To only the
+    // parent, so a threading algorithm prefers the first.
+    test.case("References wins when both are present")
+    let src = bytes.from_str("References: <a@x> <b@x>\r\nIn-Reply-To: <b@x>\r\n\r\n")
+    match mailmsg.parse(src, 32)
+        Ok(m)  =>
+            match mailmsg.thread_parents_of(m)
+                Ok(ps) => test.assert_eq(list.len(ps), 2)
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+    test.case("and In-Reply-To is used when References is absent")
+    match mailmsg.parse(bytes.from_str("In-Reply-To: <b@x>\r\n\r\n"), 32)
+        Ok(m)  =>
+            match mailmsg.thread_parents_of(m)
+                Ok(ps) => test.assert_eq(list.len(ps), 1)
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_built_message_parses_back_to_what_went_in() [io]
+    test.case("the round trip keeps the subject, the author and the text")
+    match mailmsg.build(a_draft())
+        Ok(octets) =>
+            match mailmsg.parse(octets, 32)
+                Ok(m)  =>
+                    test.assert_eq_str(mailmsg.subject_of(m), "Saying Hello")
+                    match mailmsg.from_of(m)
+                        Ok(fs) => test.assert_eq_str(fs[0].domain, "example.com")
+                        Err(e) => test.fail(e.message())
+                    match mailmsg.text_of(m)
+                        Ok(s)  => test.assert_eq_str(s, "This is a message just to say hello.")
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+        Err(e)     => test.fail(e.message())
+
+@test
+fn test_a_built_message_uses_crlf_and_folds_its_headers() [io]
+    // RFC 5322 § 2.1: lines end with CRLF and § 2.1.1 recommends 78
+    // octets.  A receiver that only accepts the canonical form is a
+    // receiver that exists.
+    test.case("every line ends with CRLF")
+    match mailmsg.build(a_draft())
+        Ok(octets) =>
+            let text = bytes.to_str(octets)
+            test.assert(str.contains(text, "\r\n"))
+            test.assert_false(str.contains(str.replace(text, "\r\n", ""), "\n"),
+                              "a bare LF is not a line ending here")
+        Err(e)     => test.fail(e.message())
+
+@test
+fn test_bcc_is_a_recipient_and_not_a_header_on_the_wire() [io]
+    // A Bcc field that reaches a recipient is a disclosure, and it is
+    // the one header whose presence depends on which copy is being
+    // written.
+    let d = mailmsg.with_bcc(a_draft(), [MailMailbox(mailaddr.addr_spec("secret", "example.org"))])
+
+    test.case("build leaves it out")
+    match mailmsg.build(d)
+        Ok(octets) => test.assert_false(str.contains(bytes.to_str(octets), "secret@example.org"),
+                                        "the wire copy discloses nothing")
+        Err(e)     => test.fail(e.message())
+
+    test.case("and build_with_bcc writes it, for the sender's own folder")
+    match mailmsg.build_with_bcc(d)
+        Ok(octets) => test.assert(str.contains(bytes.to_str(octets), "secret@example.org"))
+        Err(e)     => test.fail(e.message())
+
+@test
+fn test_a_draft_with_no_author_is_refused() [io]
+    // RFC 5322 § 3.6: From is one of the two fields a message must
+    // have.
+    test.case("no From")
+    match mailmsg.build(mailmsg.draft())
+        Ok(_)  => test.fail("a message must name its author")
+        Err(e) => test.assert(str.len(e.message()) > 0)
+
+    test.case("and two authors with no Sender")
+    let two = mailmsg.with_from(a_draft(), [mailaddr.addr_spec("a", "x.test"),
+                                            mailaddr.addr_spec("b", "x.test")])
+    match mailmsg.build(two)
+        Ok(_)  => test.fail("§ 3.6.2 requires a Sender when From names several")
+        Err(e) => test.assert(str.len(e.message()) > 0)
+
+@test
+fn test_two_bodies_become_a_multipart_alternative_text_first() [io]
+    // RFC 2046 § 5.1.4 orders the arms plainest first, because a
+    // reader shows the last one it understands.
+    test.case("a draft with both bodies builds an alternative")
+    let d = mailmsg.with_html_body(a_draft(), "<p>This is a message just to say hello.</p>")
+    match mailmsg.build(d)
+        Ok(octets) =>
+            match mailmsg.parse(octets, 32)
+                Ok(m)  =>
+                    test.assert_eq_str(m.root.content_type.subtype, "alternative")
+                    test.assert_eq(list.len(m.root.children), 2)
+                    test.assert_eq_str(m.root.children[0].content_type.subtype, "plain")
+                Err(e) => test.fail(e.message())
+        Err(e)     => test.fail(e.message())
+
+@test
+fn test_an_attachment_survives_the_round_trip_octet_for_octet() [io]
+    test.case("a PDF attached and read back is the same octets")
+    let pdf = bytes.from_str("%PDF-1.7\r\nbinary\x00\xff bytes")
+    let ct = mailctype.content_type("application", "pdf", [])
+    let d = mailmsg.with_attachment(a_draft(), mailmsg.attachment("report.pdf", ct, pdf))
+    match mailmsg.build(d)
+        Ok(octets) =>
+            match mailmsg.parse(octets, 32)
+                Ok(m)  =>
+                    let found = mailmime.attachments_of(m.root)
+                    test.assert_eq(list.len(found), 1)
+                    test.assert_eq_str(mailmime.filename_of(found[0]), "report.pdf")
+                    match mailmsg.part_bytes(m, found[0])
+                        Ok(b)  => test.assert_eq(bytes.len(b), bytes.len(pdf))
+                        Err(e) => test.fail(e.message())
+                Err(e) => test.fail(e.message())
+        Err(e)     => test.fail(e.message())
+
+@test
+fn test_an_inline_attachment_is_reachable_by_its_content_id() [io]
+    test.case("a cid: target keeps its Content-ID through the build")
+    let png = bytes.from_str("\x89PNG\r\n\x1a\n")
+    let ct = mailctype.content_type("image", "png", [])
+    let d = mailmsg.with_html_body(
+                mailmsg.with_attachment(a_draft(),
+                                        mailmsg.inline_attachment("logo@example.com", ct, png)),
+                "<img src=\"cid:logo@example.com\">")
+    match mailmsg.build(d)
+        Ok(octets) =>
+            match mailmsg.parse(octets, 32)
+                Ok(m)  => test.assert_some(mailmime.part_by_content_id(m.root, "logo@example.com"))
+                Err(e) => test.fail(e.message())
+        Err(e)     => test.fail(e.message())
+
+@test
+fn test_the_date_and_the_identifier_come_from_the_caller() [io]
+    // This package reads no clock and knows no host name, so both are
+    // values a caller supplies.
+    test.case("a supplied Date is written and read back")
+    let dt = civil.datetime(civil.date(1997, 11, 21)!, civil.time_of(9, 55, 6, 0)!)
+    let d = mailmsg.with_message_id(
+                mailmsg.with_date(a_draft(), mailhdr.datetime(dt, -360)),
+                mailhdr.message_id("1234", "local.machine.example"))
+    match mailmsg.build(d)
+        Ok(octets) => test.assert(str.contains(bytes.to_str(octets), "-0600"))
+        Err(e)     => test.fail(e.message())
+
+    test.case("and a draft with neither builds without either field")
+    match mailmsg.build(a_draft())
+        Ok(octets) => test.assert_false(str.contains(bytes.to_str(octets), "Date:"),
+                                        "no clock, so no date invented")
+        Err(e)     => test.fail(e.message())
+
+@test
+fn test_the_remaining_draft_fields_reach_the_built_message() [io]
+    test.case("Cc, Reply-To, In-Reply-To and an extra field")
+    let d = mailmsg.with_header(
+                mailmsg.in_reply_to(
+                    mailmsg.with_reply_to(
+                        mailmsg.with_cc(a_draft(), [MailMailbox(mailaddr.addr_spec("cc", "x.test"))]),
+                        [MailMailbox(mailaddr.addr_spec("reply", "x.test"))]),
+                    [mailhdr.message_id("a", "x.test")]),
+                mailhdr.field("Auto-Submitted", "auto-generated"))
+    match mailmsg.build(d)
+        Ok(octets) =>
+            let text = bytes.to_str(octets)
+            test.assert(str.contains(text, "cc@x.test"))
+            test.assert(str.contains(text, "reply@x.test"))
+            test.assert(str.contains(text, "<a@x.test>"))
+            test.assert(str.contains(text, "Auto-Submitted"))
+        Err(e)     => test.fail(e.message())

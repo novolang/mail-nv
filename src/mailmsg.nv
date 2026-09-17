@@ -1,0 +1,607 @@
+// mailmsg.nv — a whole message, read and written.
+//
+// THE TWO DIRECTIONS ARE TWO TYPES
+//
+// `MailMessage` is what a parse produces: the bytes, the header
+// section, and the tree of parts whose bodies are spans into those
+// bytes.  It is a VIEW, and every accessor on it answers a question
+// about what arrived.
+//
+// `MailDraft` is what a builder produces: no bytes yet, addresses and
+// text and attachments as values, and no spans at all.  `build` turns
+// one into octets.
+//
+// They are separate because the questions are different.  Nothing asks
+// a draft what offset its `From:` field was at, and nothing asks a
+// parsed message to add an attachment — a message with an attachment
+// added is a different message, and the bytes of the original are what
+// a signature was computed over.  A single type would have to be both
+// and would carry a span table nobody writes and a builder state
+// nobody reads.
+//
+// WHAT `build` GUARANTEES
+//
+// The octets it writes are a message RFC 5322 § 2.1 accepts: CRLF line
+// endings, no line over 998 octets, every header folded at
+// whitespace, every non-ASCII header text in encoded words, every
+// non-ASCII body in a transfer encoding, and a boundary that does not
+// occur in the parts it separates.  A message built here and parsed
+// back gives the same addresses, the same subject and the same
+// attachment octets.
+//
+// WHAT IT DOES NOT DO
+//
+// It does not send, sign, or stamp.  There is no socket in this
+// package and no clock: `Date:` is a value the caller passes, and
+// `Message-ID:` is a value the caller passes, because generating one
+// needs a host name and a source of uniqueness and both belong to
+// whoever is sending.  `smtp-nv` sends what `build` writes and
+// `dkim-nv` signs it; neither is a dependency here, because a message
+// is a message whether or not anybody sends it.
+
+use mailaddr
+use mailctype
+use mailerror
+use mailhdr
+use mailmime
+use mailxfer
+
+// A parsed message: its octets, its headers, and its tree.
+//
+// ```novo
+// use mailmsg
+//
+// fn main() [io]
+//     match mailmsg.parse(bytes.from_str("Subject: Hi\r\n\r\nbody"), 32)
+//         Ok(m)  => println(mailmsg.subject_of(m))
+//         Err(e) => println(e.message())
+// ```
+pub struct MailMessage
+    // The octets the message was parsed from.  Every span in `root`
+    // is an offset into this, so the two travel together.
+    source: Bytes
+    // The top-level header section.
+    headers: mailhdr.MailHeaders
+    // The body as a tree.  A message with no MIME headers has a single
+    // `text/plain` leaf, which is what RFC 2045 § 5.2 says it is.
+    root: mailmime.MailPart
+
+// A message being built.
+//
+// ```novo
+// use mailmsg
+//
+// fn main() [io]
+//     println("${list.len(mailmsg.draft().to)}")        // 0
+// ```
+pub struct MailDraft
+    // The `From:` mailboxes.
+    from: [mailaddr.MailAddress]
+    // The `Sender:` mailbox, or `None`.  RFC 5322 § 3.6.2 requires it
+    // when `from` names more than one mailbox, and `build` refuses a
+    // draft that breaks that rule rather than emitting a message some
+    // receivers reject.
+    sender: ?mailaddr.MailAddress
+    // The `To:` entries.
+    to: [mailaddr.MailEntry]
+    // The `Cc:` entries.
+    cc: [mailaddr.MailEntry]
+    // The `Bcc:` entries.  Written into the message only when `build`
+    // is asked for the copy that goes into the sender's own folder;
+    // the copy for the wire leaves them out, because a `Bcc:` field
+    // that reaches a recipient is a disclosure.
+    bcc: [mailaddr.MailEntry]
+    // The `Reply-To:` entries.
+    reply_to: [mailaddr.MailEntry]
+    // The `Subject:` in decoded text.  Encoded on the way out if it
+    // needs it.
+    subject: Str
+    // The `Date:`, or `None`.  A `core` package has no clock, so a
+    // draft with no date is built without a `Date:` field and the
+    // caller is expected to have supplied one.
+    date: ?mailhdr.MailDateTime
+    // The `Message-ID:`, or `None`.
+    message_id: ?mailhdr.MailMessageId
+    // The `In-Reply-To:` and `References:` identifiers.
+    in_reply_to: [mailhdr.MailMessageId]
+    // The plain text body, or `""`.
+    text_body: Str
+    // The HTML body, or `""`.  When both are present the message is a
+    // `multipart/alternative` with the text first, which is the order
+    // RFC 2046 § 5.1.4 requires.
+    html_body: Str
+    // The attachments, in the order they will appear.
+    attachments: [MailAttachment]
+    // Any other header fields the caller wants, appended after the
+    // ones above.
+    extra: [mailhdr.MailField]
+
+// A file to attach.
+//
+// ```novo
+// use mailmsg
+// use mailctype
+//
+// fn main() [io]
+//     let a = mailmsg.attachment("a.txt", mailctype.content_type("text", "plain", []), bytes.from_str("hi"))
+//     println(a.filename)                               // a.txt
+// ```
+pub struct MailAttachment
+    // The name the recipient will be offered.
+    filename: Str
+    // The media type.
+    content_type: mailctype.MailContentType
+    // The octets, undecoded and unencoded: `build` chooses the
+    // transfer encoding and applies it.
+    content: Bytes
+    // The `Content-ID` without brackets, or `""`.  Set it when an
+    // HTML body refers to the attachment with a `cid:` URL, which
+    // makes the message a `multipart/related`.
+    content_id: Str
+    // True when the part should be shown in place rather than offered
+    // as a file.
+    inline: Bool
+
+// A message parsed from octets.
+//
+// `max_depth` bounds the nesting of `multipart` and `message/rfc822`
+// parts; pass 32 unless there is a reason not to.  The octets are kept
+// in the result, because every part's body is a span into them.
+//
+// ```novo
+// use mailmsg
+//
+// fn main() [io]
+//     match mailmsg.parse(bytes.from_str("Subject: Hi\r\n\r\nbody"), 32)
+//         Ok(m)  => println("${list.len(m.headers.fields)}")   // 1
+//         Err(e) => println(e.message())
+// ```
+pub fn parse(source: Bytes, max_depth: Int) -> Result<MailMessage, mailerror.MailError>
+    todo("mail-nv.mailmsg.parse")
+
+// The `Subject:` with its encoded words decoded, or `""`.
+//
+// Decoded rather than raw, because every caller wants the text and the
+// raw form is still reachable through `m.headers`.
+//
+// ```novo
+// use mailmsg
+//
+// fn main() [io]
+//     match mailmsg.parse(bytes.from_str("Subject: Hi\r\n\r\n"), 32)
+//         Ok(m)  => println(mailmsg.subject_of(m))      // Hi
+//         Err(e) => println(e.message())
+// ```
+pub fn subject_of(m: MailMessage) -> Str
+    todo("mail-nv.mailmsg.subject_of")
+
+// The `From:` mailboxes, with any group flattened.
+//
+// A list and not one address, because RFC 5322 § 3.6.2 allows several
+// and a message with two authors is a message.  A caller that needs
+// one asks whether the list has exactly one member.
+//
+// ```novo
+// use mailmsg
+//
+// fn main() [io]
+//     match mailmsg.parse(bytes.from_str("From: a@b.c\r\n\r\n"), 32)
+//         Ok(m)  =>
+//             match mailmsg.from_of(m)
+//                 Ok(fs) => println("${list.len(fs)}")   // 1
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn from_of(m: MailMessage) -> Result<[mailaddr.MailAddress], mailerror.MailError>
+    todo("mail-nv.mailmsg.from_of")
+
+// The `To:`, `Cc:` and `Bcc:` entries together, in that order.
+//
+// What a delivery agent wants: everybody the message names, without
+// three calls and a concatenation, and with the groups preserved so
+// that `undisclosed-recipients:;` is still visible for what it is.
+//
+// ```novo
+// use mailmsg
+//
+// fn main() [io]
+//     match mailmsg.parse(bytes.from_str("To: a@b.c\r\n\r\n"), 32)
+//         Ok(m)  =>
+//             match mailmsg.recipients_of(m)
+//                 Ok(rs) => println("${list.len(rs)}")   // 1
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn recipients_of(m: MailMessage) -> Result<[mailaddr.MailEntry], mailerror.MailError>
+    todo("mail-nv.mailmsg.recipients_of")
+
+// The `Date:` parsed, or `None` when the field is absent.
+//
+// `MailBadDate` when the field is there and does not parse, which is
+// a different answer from absent and is the one a caller should
+// report rather than silently substituting a time.
+//
+// ```novo
+// use mailmsg
+//
+// fn main() [io]
+//     match mailmsg.parse(bytes.from_str("Subject: x\r\n\r\n"), 32)
+//         Ok(m)  =>
+//             match mailmsg.date_of(m)
+//                 Ok(d)  => println("${d != None}")      // false
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn date_of(m: MailMessage) -> Result<?mailhdr.MailDateTime, mailerror.MailError>
+    todo("mail-nv.mailmsg.date_of")
+
+// The `Message-ID:` parsed, or `None`.
+//
+// ```novo
+// use mailmsg
+//
+// fn main() [io]
+//     match mailmsg.parse(bytes.from_str("Message-ID: <a@b>\r\n\r\n"), 32)
+//         Ok(m)  =>
+//             match mailmsg.message_id_of(m)
+//                 Ok(_)  => println("read")
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn message_id_of(m: MailMessage) -> Result<?mailhdr.MailMessageId, mailerror.MailError>
+    todo("mail-nv.mailmsg.message_id_of")
+
+// The identifiers of the messages this one replies to: `References:`
+// if present, otherwise `In-Reply-To:`.
+//
+// That order is what every threading implementation uses, because
+// `References:` carries the whole chain and `In-Reply-To:` carries
+// only the parent.
+//
+// ```novo
+// use mailmsg
+//
+// fn main() [io]
+//     match mailmsg.parse(bytes.from_str("References: <a@b>\r\n\r\n"), 32)
+//         Ok(m)  =>
+//             match mailmsg.thread_parents_of(m)
+//                 Ok(ps) => println("${list.len(ps)}")   // 1
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn thread_parents_of(m: MailMessage) -> Result<[mailhdr.MailMessageId], mailerror.MailError>
+    todo("mail-nv.mailmsg.thread_parents_of")
+
+// The message's plain text, from the part a reader would show, or
+// `""`.
+//
+// ```novo
+// use mailmsg
+//
+// fn main() [io]
+//     match mailmsg.parse(bytes.from_str("Subject: x\r\n\r\nhello"), 32)
+//         Ok(m)  =>
+//             match mailmsg.text_of(m)
+//                 Ok(s)  => println(s)                   // hello
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn text_of(m: MailMessage) -> Result<Str, mailerror.MailError>
+    todo("mail-nv.mailmsg.text_of")
+
+// The octets of a part, decoded, taken from the message they belong
+// to.
+//
+// The convenience that pairs a message with its own spans, so a caller
+// extracting an attachment never has to remember which `Bytes` a part
+// came from.
+//
+// ```novo
+// use mailmsg
+//
+// fn main() [io]
+//     match mailmsg.parse(bytes.from_str("Subject: x\r\n\r\nhi"), 32)
+//         Ok(m)  =>
+//             match mailmsg.part_bytes(m, m.root)
+//                 Ok(b)  => println("${bytes.len(b)}")   // 2
+//                 Err(e) => println(e.message())
+//         Err(e) => println(e.message())
+// ```
+pub fn part_bytes(m: MailMessage, p: mailmime.MailPart) -> Result<Bytes, mailerror.MailError>
+    todo("mail-nv.mailmsg.part_bytes")
+
+// An empty draft: no addresses, no subject, no body.
+//
+// ```novo
+// use mailmsg
+//
+// fn main() [io]
+//     println("${str.len(mailmsg.draft().subject)}")    // 0
+// ```
+pub fn draft() -> MailDraft
+    todo("mail-nv.mailmsg.draft")
+
+// The draft with its `From:` set.
+//
+// ```novo
+// use mailmsg
+// use mailaddr
+//
+// fn main() [io]
+//     let d = mailmsg.with_from(mailmsg.draft(), [mailaddr.addr_spec("ada", "example.com")])
+//     println("${list.len(d.from)}")                    // 1
+// ```
+pub fn with_from(d: MailDraft, from: [mailaddr.MailAddress]) -> MailDraft
+    todo("mail-nv.mailmsg.with_from")
+
+// The draft with its `To:` set.
+//
+// ```novo
+// use mailmsg
+// use mailaddr
+//
+// fn main() [io]
+//     let to = [MailMailbox(mailaddr.addr_spec("ada", "example.com"))]
+//     println("${list.len(mailmsg.with_to(mailmsg.draft(), to).to)}")   // 1
+// ```
+pub fn with_to(d: MailDraft, to: [mailaddr.MailEntry]) -> MailDraft
+    todo("mail-nv.mailmsg.with_to")
+
+// The draft with its `Cc:` set.
+//
+// ```novo
+// use mailmsg
+//
+// fn main() [io]
+//     println("${list.len(mailmsg.with_cc(mailmsg.draft(), []).cc)}")   // 0
+// ```
+pub fn with_cc(d: MailDraft, cc: [mailaddr.MailEntry]) -> MailDraft
+    todo("mail-nv.mailmsg.with_cc")
+
+// The draft with its `Bcc:` set.
+//
+// A `Bcc:` here is a recipient, not a header: `build` leaves the field
+// out of the octets it writes for the wire.  `build_with_bcc` is the
+// one that writes it, for the copy that goes into the sender's own
+// folder.
+//
+// ```novo
+// use mailmsg
+//
+// fn main() [io]
+//     println("${list.len(mailmsg.with_bcc(mailmsg.draft(), []).bcc)}") // 0
+// ```
+pub fn with_bcc(d: MailDraft, bcc: [mailaddr.MailEntry]) -> MailDraft
+    todo("mail-nv.mailmsg.with_bcc")
+
+// The draft with its `Reply-To:` set.
+//
+// ```novo
+// use mailmsg
+//
+// fn main() [io]
+//     println("${list.len(mailmsg.with_reply_to(mailmsg.draft(), []).reply_to)}")
+// ```
+pub fn with_reply_to(d: MailDraft, reply_to: [mailaddr.MailEntry]) -> MailDraft
+    todo("mail-nv.mailmsg.with_reply_to")
+
+// The draft with its subject set, as decoded text.
+//
+// ```novo
+// use mailmsg
+//
+// fn main() [io]
+//     println(mailmsg.with_subject(mailmsg.draft(), "Hello").subject)
+// ```
+pub fn with_subject(d: MailDraft, subject: Str) -> MailDraft
+    todo("mail-nv.mailmsg.with_subject")
+
+// The draft with its `Date:` set.
+//
+// The instant comes from the caller: this package reads no clock.
+//
+// ```novo
+// use mailmsg
+// use mailhdr
+// use civil
+//
+// fn main() [io]
+//     let dt = civil.datetime(civil.date(2026, 9, 17)!, civil.midnight())
+//     let d = mailmsg.with_date(mailmsg.draft(), mailhdr.datetime(dt, 0))
+//     println("${d.date != None}")                      // true
+// ```
+pub fn with_date(d: MailDraft, date: mailhdr.MailDateTime) -> MailDraft
+    todo("mail-nv.mailmsg.with_date")
+
+// The draft with its `Message-ID:` set.
+//
+// The identifier comes from the caller, because a unique one needs a
+// host name and a source of uniqueness and this package has neither.
+//
+// ```novo
+// use mailmsg
+// use mailhdr
+//
+// fn main() [io]
+//     let d = mailmsg.with_message_id(mailmsg.draft(), mailhdr.message_id("a1", "example.com"))
+//     println("${d.message_id != None}")                // true
+// ```
+pub fn with_message_id(d: MailDraft, id: mailhdr.MailMessageId) -> MailDraft
+    todo("mail-nv.mailmsg.with_message_id")
+
+// The draft marked as a reply to these identifiers.
+//
+// Writes both `In-Reply-To:` with the last of them and `References:`
+// with all of them, which is what RFC 5322 § 3.6.4 describes and what
+// keeps a thread intact across clients.
+//
+// ```novo
+// use mailmsg
+// use mailhdr
+//
+// fn main() [io]
+//     let d = mailmsg.in_reply_to(mailmsg.draft(), [mailhdr.message_id("a", "b")])
+//     println("${list.len(d.in_reply_to)}")             // 1
+// ```
+pub fn in_reply_to(d: MailDraft, parents: [mailhdr.MailMessageId]) -> MailDraft
+    todo("mail-nv.mailmsg.in_reply_to")
+
+// The draft with its plain text body set.
+//
+// ```novo
+// use mailmsg
+//
+// fn main() [io]
+//     println(mailmsg.with_text_body(mailmsg.draft(), "hello").text_body)
+// ```
+pub fn with_text_body(d: MailDraft, text: Str) -> MailDraft
+    todo("mail-nv.mailmsg.with_text_body")
+
+// The draft with its HTML body set.
+//
+// A draft with both bodies is built as a `multipart/alternative` with
+// the plain text first, because RFC 2046 § 5.1.4 orders the arms from
+// plainest to richest and a reader shows the last one it understands.
+//
+// ```novo
+// use mailmsg
+//
+// fn main() [io]
+//     println("${str.len(mailmsg.with_html_body(mailmsg.draft(), "<p>hi</p>").html_body)}")
+// ```
+pub fn with_html_body(d: MailDraft, html: Str) -> MailDraft
+    todo("mail-nv.mailmsg.with_html_body")
+
+// An attachment.
+//
+// ```novo
+// use mailmsg
+// use mailctype
+//
+// fn main() [io]
+//     let ct = mailctype.content_type("application", "pdf", [])
+//     println(mailmsg.attachment("r.pdf", ct, bytes.from_str("%PDF")).filename)
+// ```
+pub fn attachment(filename: Str, ct: mailctype.MailContentType, content: Bytes) -> MailAttachment
+    todo("mail-nv.mailmsg.attachment")
+
+// An attachment shown in place, with a `Content-ID` an HTML body can
+// refer to with a `cid:` URL.
+//
+// ```novo
+// use mailmsg
+// use mailctype
+//
+// fn main() [io]
+//     let ct = mailctype.content_type("image", "png", [])
+//     println(mailmsg.inline_attachment("logo@example.com", ct, bytes.from_str("\x89PNG")).content_id)
+// ```
+pub fn inline_attachment(content_id: Str, ct: mailctype.MailContentType,
+                         content: Bytes) -> MailAttachment
+    todo("mail-nv.mailmsg.inline_attachment")
+
+// The draft with an attachment appended.
+//
+// ```novo
+// use mailmsg
+// use mailctype
+//
+// fn main() [io]
+//     let a = mailmsg.attachment("a.txt", mailctype.content_type("text", "plain", []), bytes.from_str("hi"))
+//     println("${list.len(mailmsg.with_attachment(mailmsg.draft(), a).attachments)}")
+// ```
+pub fn with_attachment(d: MailDraft, a: MailAttachment) -> MailDraft
+    todo("mail-nv.mailmsg.with_attachment")
+
+// The draft with an extra header field appended.
+//
+// For the fields this package gives no builder: `Auto-Submitted:`,
+// `List-Unsubscribe:`, an `X-` field a service uses.  The value is
+// folded and encoded on the way out like any other.
+//
+// ```novo
+// use mailmsg
+// use mailhdr
+//
+// fn main() [io]
+//     let d = mailmsg.with_header(mailmsg.draft(), mailhdr.field("Auto-Submitted", "auto-generated"))
+//     println("${list.len(d.extra)}")                   // 1
+// ```
+pub fn with_header(d: MailDraft, f: mailhdr.MailField) -> MailDraft
+    todo("mail-nv.mailmsg.with_header")
+
+// The draft written as message octets, for the wire.
+//
+// `Bcc:` is left out.  `MailBadAddress` when a draft has no `From:`,
+// and when it names several `From:` mailboxes with no `Sender:` —
+// RFC 5322 § 3.6.2 requires one, and a message that breaks the rule
+// is rejected by enough receivers to be worth refusing here.
+//
+// ```novo
+// use mailmsg
+// use mailaddr
+//
+// fn main() [io]
+//     let d = mailmsg.with_text_body(
+//                 mailmsg.with_from(mailmsg.draft(), [mailaddr.addr_spec("ada", "example.com")]),
+//                 "hello")
+//     match mailmsg.build(d)
+//         Ok(b)  => println("${bytes.len(b)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn build(d: MailDraft) -> Result<Bytes, mailerror.MailError>
+    todo("mail-nv.mailmsg.build")
+
+// The draft written as message octets WITH the `Bcc:` field, for the
+// copy a sender files in its own sent folder.
+//
+// Named rather than a flag, so that a reviewer reading a call site can
+// see which of the two a program is writing to the wire.
+//
+// ```novo
+// use mailmsg
+// use mailaddr
+//
+// fn main() [io]
+//     let d = mailmsg.with_from(mailmsg.draft(), [mailaddr.addr_spec("ada", "example.com")])
+//     match mailmsg.build_with_bcc(d)
+//         Ok(b)  => println("${bytes.len(b)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn build_with_bcc(d: MailDraft) -> Result<Bytes, mailerror.MailError>
+    todo("mail-nv.mailmsg.build_with_bcc")
+
+// The header section of a parsed message, written back exactly as it
+// arrived, octet for octet.
+//
+// What a signature is computed over.  A rebuild from the parsed fields
+// would normalise the folding and the case and would produce a
+// different hash, so this returns the original span rather than a
+// re-rendering.
+//
+// ```novo
+// use mailmsg
+//
+// fn main() [io]
+//     match mailmsg.parse(bytes.from_str("Subject: x\r\n\r\n"), 32)
+//         Ok(m)  => println("${mailmsg.raw_header_span(m).len}")
+//         Err(e) => println(e.message())
+// ```
+pub fn raw_header_span(m: MailMessage) -> mailxfer.MailSpan
+    todo("mail-nv.mailmsg.raw_header_span")
+
+// The span of a parsed message's body: everything after the blank line
+// that ends the header section.
+//
+// The other half of what a signature covers.
+//
+// ```novo
+// use mailmsg
+//
+// fn main() [io]
+//     match mailmsg.parse(bytes.from_str("Subject: x\r\n\r\nbody"), 32)
+//         Ok(m)  => println("${mailmsg.raw_body_span(m).len}")   // 4
+//         Err(e) => println(e.message())
+// ```
+pub fn raw_body_span(m: MailMessage) -> mailxfer.MailSpan
+    todo("mail-nv.mailmsg.raw_body_span")

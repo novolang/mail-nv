@@ -1,0 +1,54 @@
+[package]
+name        = "mail-nv"
+version     = "0.0.1"
+description = "RFC 5322 messages and MIME, both directions: a message parsed into typed headers — addresses, dates over calendar-nv, message identifiers, content types with their parameters — and a tree of parts whose bodies are spans into the caller's octets, and built back with correct folding, encoded words and transfer encodings.  No socket: smtp-nv sends what this writes and dkim-nv signs it."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`.  A message is a byte string with a grammar over it, and
+# nothing in that grammar needs the machine: this package opens no
+# socket, reads no file, and reads no clock.
+#
+# Two consequences are visible in the signatures rather than hidden.
+# `Date:` and `Message-ID:` are VALUES a caller supplies when it builds
+# a message, because generating either one needs a clock or a host name;
+# and `mailmime.fresh_boundary` takes a seed, because RFC 2046 § 5.1.1
+# wants a boundary that does not occur in the content and this package
+# has no randomness to pick one with.
+#
+# The third is the shape of the whole package.  A part's body is a
+# `mailxfer.MailSpan` into the octets the message was parsed from, not a
+# copy, so reading a 30 MB message with four attachments allocates the
+# tree and nothing else.  The host owns the bytes; this package owns the
+# grammar.
+layer       = "core"
+
+category    = "networking"
+
+tags        = ["email", "mime", "rfc-5322", "rfc-2045", "rfc-2047", "message", "smtp", "attachment"]
+repository  = "https://github.com/novolang/mail-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.9.0"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "A message read into typed headers and a tree, and written back"
+
+[dependencies]
+# calendar-nv supplies `CivilDateTime`, which is exactly what RFC 5322
+# § 3.3's `date-time` carries: a civil date, a time of day, and an
+# offset from UTC in minutes.  Not an instant — the field names no zone
+# and this package has no zone database — so `MailDateTime` is
+# calendar-nv's value plus the offset, and converting it to an instant
+# is left to a caller that knows what an instant means.  Declaring a
+# date type here instead would collide with calendar-nv's on the way
+# into any program that used both.  `core`, so the layer rule holds.
+calendar-nv = "^0.0.2"

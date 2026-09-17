@@ -1,0 +1,160 @@
+// mailerror.nv — every way a message can be refused, and the offset in
+// the source bytes where it went wrong.
+//
+// WHY AN OFFSET IS CARRIED
+//
+// A mail message is one byte string that a parser walks once.  When it
+// stops, the useful fact is not "malformed" but WHERE: an operator
+// looking at a quarantined message wants the octet, and a test that
+// asserts a refusal wants to assert the position too, or it is
+// asserting almost nothing.  Every arm that can name a position does,
+// and `offset_of` is the one function that reads it back.
+//
+// WHY THE REASONS ARE SEPARATE
+//
+// The four things a mail parser meets have four different answers.  A
+// header line that is not `name: value` is a broken sender.  A
+// multipart whose closing boundary never arrives is a truncated
+// transfer.  A base64 body with an illegal character is a corrupted
+// one.  An encoded word naming a charset this package does not decode
+// is a message that arrived intact and cannot be shown.  A caller that
+// cannot tell them apart cannot quarantine, retry or report any of
+// them, so they are separate arms here.
+
+// Why a message, a header or a body part was refused.
+//
+// ```novo
+// use mailerror
+//
+// fn main() [io]
+//     println(MailHeaderMalformed(12).message())
+// ```
+pub enum MailError
+    // A header line is not `field-name ":" field-body` (RFC 5322
+    // § 2.2).  The offset is the first octet of the offending line.
+    MailHeaderMalformed(offset: Int)
+    // A header field name contains an octet outside the printable US
+    // ASCII range 33..126 excluding `:`, which RFC 5322 § 3.6.8 calls
+    // `ftext`.  The offset is the octet.
+    MailBadFieldName(offset: Int)
+    // The header section never ended: the message ran out before the
+    // empty line that RFC 5322 § 2.1 puts between headers and body.
+    MailHeadersUnterminated(offset: Int)
+    // An address could not be parsed as RFC 5322 § 3.4's `mailbox` or
+    // `group`.  `why` is the sub-production that failed.
+    MailBadAddress(offset: Int, why: Str)
+    // A `Date:` field is not RFC 5322 § 3.3's `date-time`.
+    MailBadDate(offset: Int)
+    // A `Message-ID:`, `In-Reply-To:` or `References:` field is not
+    // RFC 5322 § 3.6.4's `msg-id`.
+    MailBadMessageId(offset: Int)
+    // A `Content-Type:` or `Content-Disposition:` field is not RFC
+    // 2045 § 5.1's grammar.  `why` names the part that failed.
+    MailBadContentType(offset: Int, why: Str)
+    // A `multipart/*` body declares no `boundary` parameter, which
+    // RFC 2046 § 5.1.1 requires.
+    MailMissingBoundary(offset: Int)
+    // A `multipart/*` body ended before its closing delimiter
+    // `--boundary--`.  The transfer was truncated.
+    MailBoundaryUnterminated(offset: Int)
+    // A `Content-Transfer-Encoding:` names a mechanism this package
+    // does not decode.  The name is carried so a log can show it; RFC
+    // 2045 § 6.4 lists the five this package implements.
+    MailUnknownTransferEncoding(name: Str)
+    // A quoted-printable body breaks RFC 2045 § 6.7 — an `=` not
+    // followed by two hexadecimal digits or a soft line break.
+    MailBadQuotedPrintable(offset: Int)
+    // A base64 body breaks RFC 2045 § 6.8 — an octet outside the
+    // alphabet, or padding in the middle.
+    MailBadBase64(offset: Int)
+    // An encoded word is not RFC 2047 § 2's
+    // `=?charset?encoding?text?=`.
+    MailBadEncodedWord(offset: Int)
+    // An encoded word names a character set this package does not
+    // convert.  The message is intact and cannot be rendered; the raw
+    // bytes are still reachable.  RFC 2047 § 2.
+    MailUnknownCharset(name: Str)
+    // An RFC 2231 parameter continuation is missing a section, has two
+    // of the same section, or mixes the extended and plain forms for
+    // one name.  RFC 2231 § 3.
+    MailBadParameterContinuation(name: Str, why: Str)
+    // A line exceeds the 998 octets RFC 5322 § 2.1.1 allows, and the
+    // caller asked for the strict reading.
+    MailLineTooLong(offset: Int)
+    // A part nests deeper than the limit the caller set, which is how
+    // a `message/rfc822` bomb is refused rather than recursed into.
+    MailTooDeep(depth: Int)
+    // A span names octets outside the message it was taken from.  A
+    // caller kept a span past the bytes it was cut from.
+    MailSpanOutOfRange(offset: Int, len: Int)
+
+// `MailError` is an `Error`, which is what lets `Result<T, MailError>`
+// exist at all (SPEC § 3.4).
+impl Error for MailError
+    // The one-line message, for a log: what happened and where.
+    //
+    // Panics with `not implemented` until the bodies land.
+    fn message(self) -> Str
+        todo("mail-nv.MailError.message")
+
+// The octet offset a refusal names, or `-1` for the arms that name a
+// string instead of a position.
+//
+// A caller quarantining a message writes the offset into the report,
+// and a test asserting a refusal asserts the position with it.
+//
+// ```novo
+// use mailerror
+//
+// fn main() [io]
+//     println("${mailerror.offset_of(MailBadBase64(4096))}")   // 4096
+// ```
+pub fn offset_of(e: MailError) -> Int
+    todo("mail-nv.mailerror.offset_of")
+
+// A short stable identifier for a refusal, for a metric label or a log
+// field: `"header-malformed"`, `"bad-base64"`, `"unknown-charset"`.
+//
+// Stable across releases, unlike `message`, so counting them is safe.
+//
+// ```novo
+// use mailerror
+//
+// fn main() [io]
+//     println(mailerror.code(MailBadDate(31)))        // bad-date
+// ```
+pub fn code(e: MailError) -> Str
+    todo("mail-nv.mailerror.code")
+
+// Whether the message arrived intact and this package simply cannot
+// render it.
+//
+// True for `MailUnknownCharset` and `MailUnknownTransferEncoding`, and
+// false for everything else.  The distinction decides what a mail
+// store does: an unrenderable message is kept and shown as raw bytes,
+// a malformed one is quarantined.
+//
+// ```novo
+// use mailerror
+//
+// fn main() [io]
+//     println("${mailerror.is_unrenderable(MailUnknownCharset("x-mac-ce"))}")   // true
+// ```
+pub fn is_unrenderable(e: MailError) -> Bool
+    todo("mail-nv.mailerror.is_unrenderable")
+
+// Whether a refusal means the transfer was cut short rather than
+// written wrongly.
+//
+// True for `MailHeadersUnterminated` and `MailBoundaryUnterminated`.
+// A caller feeding a message in chunks uses it to decide between
+// waiting for more bytes and rejecting what it has.
+//
+// ```novo
+// use mailerror
+//
+// fn main() [io]
+//     println("${mailerror.is_truncated(MailBoundaryUnterminated(900))}")   // true
+// ```
+pub fn is_truncated(e: MailError) -> Bool
+    todo("mail-nv.mailerror.is_truncated")

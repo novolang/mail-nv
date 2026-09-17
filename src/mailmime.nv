@@ -1,0 +1,349 @@
+// mailmime.nv — the body as a tree of parts, with every payload left
+// where it lies.
+//
+// WHAT MIME ADDED TO A MESSAGE
+//
+// RFC 5322 gives a message one body: a sequence of lines.  RFC 2045
+// through 2049 turn that body into a TREE.  A part whose
+// `Content-Type` is `multipart/*` has a `boundary` parameter, and its
+// body is the parts between the lines `--boundary` and the final
+// `--boundary--` (RFC 2046 § 5.1.1).  Each of those parts has its own
+// headers and its own body, and may itself be a multipart.  A part
+// whose type is `message/rfc822` holds a whole message, headers and
+// all.
+//
+// Three subtypes carry most of the meaning.  `multipart/mixed` is a
+// sequence to be shown in order.  `multipart/alternative` is the SAME
+// content several ways, best last, and a reader shows exactly one of
+// them — the last it understands (§ 5.1.4).  `multipart/related` is
+// one document plus the resources it refers to, and the `start`
+// parameter says which part is the document (RFC 2387).
+//
+// THE PAYLOAD IS A SPAN, NEVER A COPY
+//
+// A part holds a `mailxfer.MailSpan` into the message's bytes, not the
+// octets.  Parsing a 30 MB message with four attachments allocates the
+// tree and nothing else; a caller that wants one attachment calls
+// `decoded_body` and pays for that one.  A caller that wanted the file
+// names pays for none of them.  The cost of the shape is that a span
+// is only meaningful against the bytes it was cut from, and
+// `decoded_body` takes those bytes as its first argument so the
+// pairing is visible at every call site.
+//
+// THE PREAMBLE AND THE EPILOGUE ARE KEPT
+//
+// The text before the first boundary and after the last one is not a
+// part, and RFC 2046 § 5.1.1 says a reader must ignore it.  It is kept
+// here as a span anyway, because "this message has a preamble saying
+// `This is a multi-part message in MIME format.`" is a fact a
+// forensic tool and a signature verifier both want, and ignoring
+// something is the caller's decision to make.
+
+use mailctype
+use mailerror
+use mailhdr
+use mailxfer
+
+// One node of the tree: a part's headers, its decoded type, and its
+// body.
+//
+// ```novo
+// use mailmime
+// use mailctype
+//
+// fn main() [io]
+//     let p = mailmime.leaf_part(mailctype.default_content_type(), mailxfer.span(0, 0))
+//     println(p.content_type.subtype)                   // plain
+// ```
+pub struct MailPart
+    // The part's own header fields, unfolded.
+    headers: mailhdr.MailHeaders
+    // The `Content-Type`, with RFC 2045 § 5.2's `text/plain;
+    // charset=us-ascii` applied when the field was absent.
+    content_type: mailctype.MailContentType
+    // The `Content-Disposition`, or `None` when the part had none.
+    disposition: ?mailctype.MailDisposition
+    // The `Content-Transfer-Encoding`, `7bit` when the field was
+    // absent (RFC 2045 § 6.1).
+    encoding: mailctype.MailTransferEncoding
+    // The `Content-ID` without its angle brackets, or `""`.  What a
+    // `cid:` URL in an HTML part refers to (RFC 2392).
+    content_id: Str
+    // The part's body, still encoded, as a span into the message's
+    // bytes.  Empty for a multipart, whose content is its children.
+    body: mailxfer.MailSpan
+    // The children of a `multipart/*` part, in order.  Empty for a
+    // leaf.  A `message/rfc822` part has exactly one child: the
+    // message it carries.
+    children: [MailPart]
+    // The text before the first boundary of a multipart, which RFC
+    // 2046 § 5.1.1 says a reader ignores.  Empty for a leaf.
+    preamble: mailxfer.MailSpan
+    // The text after the closing boundary.  Empty for a leaf.
+    epilogue: mailxfer.MailSpan
+    // How deep this part sits, with the message's own body at 0.
+    depth: Int
+
+// How a body is walked when a caller asks for its text.
+//
+// ```novo
+// use mailmime
+//
+// fn main() [io]
+//     println("${list.len(mailmime.walk_order(mailmime.leaf_part(mailctype.default_content_type(), mailxfer.span(0, 0))))}")
+// ```
+pub enum MailWalkOrder
+    // Every part, parents before children.  What an indexer wants.
+    MailPreOrder
+    // Only the parts a reader would display: one arm of each
+    // `multipart/alternative`, every arm of a `multipart/mixed`.
+    MailDisplayOrder
+
+// A leaf part from a type and a span.
+//
+// ```novo
+// use mailmime
+// use mailctype
+//
+// fn main() [io]
+//     let p = mailmime.leaf_part(mailctype.content_type("text", "plain", []), mailxfer.span(0, 5))
+//     println("${p.body.len}")                          // 5
+// ```
+pub fn leaf_part(ct: mailctype.MailContentType, body: mailxfer.MailSpan) -> MailPart
+    todo("mail-nv.mailmime.leaf_part")
+
+// A multipart part from a type and its children.
+//
+// `MailMissingBoundary` is not raised here: this builds a value, and a
+// type with no `boundary` parameter is refused when the message is
+// written, where the message can be named.
+//
+// ```novo
+// use mailmime
+// use mailctype
+//
+// fn main() [io]
+//     let ct = mailctype.content_type("multipart", "mixed", [mailctype.param("boundary", "sep")])
+//     println("${list.len(mailmime.multipart_part(ct, []).children)}")   // 0
+// ```
+pub fn multipart_part(ct: mailctype.MailContentType, children: [MailPart]) -> MailPart
+    todo("mail-nv.mailmime.multipart_part")
+
+// The tree parsed from a part's headers and the span its body
+// occupies.
+//
+// `max_depth` bounds the nesting: a `message/rfc822` inside a
+// `multipart` inside a `message/rfc822` is a legal message and is also
+// how a decompression bomb is written, so the limit is a parameter and
+// `MailTooDeep` is what exceeding it answers.  Pass 32 unless there is
+// a reason not to.
+//
+// ```novo
+// use mailmime
+// use mailhdr
+//
+// fn main() [io]
+//     let h = mailhdr.headers([])
+//     match mailmime.parse_part(bytes.from_str("hello"), h, mailxfer.span(0, 5), 32)
+//         Ok(p)  => println("${p.depth}")               // 0
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_part(source: Bytes, headers: mailhdr.MailHeaders, body: mailxfer.MailSpan,
+                  max_depth: Int) -> Result<MailPart, mailerror.MailError>
+    todo("mail-nv.mailmime.parse_part")
+
+// The part's body decoded: the span sliced out of the source and the
+// transfer encoding removed.
+//
+// The source must be the bytes the part was parsed from.
+// `MailSpanOutOfRange` when it is not, which is the failure a caller
+// gets for holding a tree past its message instead of silently wrong
+// octets.
+//
+// ```novo
+// use mailmime
+// use mailctype
+//
+// fn main() [io]
+//     let p = mailmime.leaf_part(mailctype.default_content_type(), mailxfer.span(0, 2))
+//     match mailmime.decoded_body(bytes.from_str("hi"), p)
+//         Ok(b)  => println("${bytes.len(b)}")          // 2
+//         Err(e) => println(e.message())
+// ```
+pub fn decoded_body(source: Bytes, p: MailPart) -> Result<Bytes, mailerror.MailError>
+    todo("mail-nv.mailmime.decoded_body")
+
+// The part's body decoded and converted to text using the character
+// set its `Content-Type` names.
+//
+// `MailUnknownCharset` when the set is not one of the three this
+// package converts.  The bytes are still reachable through
+// `decoded_body`, so a refusal here loses nothing.
+//
+// ```novo
+// use mailmime
+// use mailctype
+//
+// fn main() [io]
+//     let p = mailmime.leaf_part(mailctype.default_content_type(), mailxfer.span(0, 2))
+//     match mailmime.decoded_text(bytes.from_str("hi"), p)
+//         Ok(s)  => println(s)                          // hi
+//         Err(e) => println(e.message())
+// ```
+pub fn decoded_text(source: Bytes, p: MailPart) -> Result<Str, mailerror.MailError>
+    todo("mail-nv.mailmime.decoded_text")
+
+// Every part of the tree in one flat list, parents before children.
+//
+// ```novo
+// use mailmime
+// use mailctype
+//
+// fn main() [io]
+//     let p = mailmime.leaf_part(mailctype.default_content_type(), mailxfer.span(0, 0))
+//     println("${list.len(mailmime.walk_order(p))}")    // 1
+// ```
+pub fn walk_order(p: MailPart) -> [MailPart]
+    todo("mail-nv.mailmime.walk_order")
+
+// The parts a reader would display, in the order it would show them.
+//
+// Applies RFC 2046 § 5.1.4's rule for `multipart/alternative`: the
+// LAST arm the package understands is the one shown, because the
+// specification orders the arms from plainest to richest.  A caller
+// that wants every arm calls `walk_order` instead.
+//
+// ```novo
+// use mailmime
+// use mailctype
+//
+// fn main() [io]
+//     let p = mailmime.leaf_part(mailctype.default_content_type(), mailxfer.span(0, 0))
+//     println("${list.len(mailmime.display_parts(p))}") // 1
+// ```
+pub fn display_parts(p: MailPart) -> [MailPart]
+    todo("mail-nv.mailmime.display_parts")
+
+// The first `text/plain` part a reader would show, or `None`.
+//
+// ```novo
+// use mailmime
+// use mailctype
+//
+// fn main() [io]
+//     let p = mailmime.leaf_part(mailctype.default_content_type(), mailxfer.span(0, 0))
+//     match mailmime.text_part(p)
+//         Some(_) => println("there is a plain text part")
+//         None    => println("none")
+// ```
+pub fn text_part(p: MailPart) -> ?MailPart
+    todo("mail-nv.mailmime.text_part")
+
+// The first `text/html` part a reader would show, or `None`.
+//
+// ```novo
+// use mailmime
+// use mailctype
+//
+// fn main() [io]
+//     let p = mailmime.leaf_part(mailctype.content_type("text", "html", []), mailxfer.span(0, 0))
+//     match mailmime.html_part(p)
+//         Some(_) => println("there is an HTML part")
+//         None    => println("none")
+// ```
+pub fn html_part(p: MailPart) -> ?MailPart
+    todo("mail-nv.mailmime.html_part")
+
+// Every part a caller would offer as a file.
+//
+// A part counts when `mailctype.disposition_is_attachment` says so, or
+// when it has a `filename` parameter and is not the body text.  The
+// order is the order of the tree, so an index into this list is stable
+// for one message.
+//
+// ```novo
+// use mailmime
+// use mailctype
+//
+// fn main() [io]
+//     let p = mailmime.leaf_part(mailctype.default_content_type(), mailxfer.span(0, 0))
+//     println("${list.len(mailmime.attachments_of(p))}")    // 0
+// ```
+pub fn attachments_of(p: MailPart) -> [MailPart]
+    todo("mail-nv.mailmime.attachments_of")
+
+// The part a `cid:` reference names, or `None`.
+//
+// The identifier is matched against `Content-ID` without the angle
+// brackets, which is what RFC 2392 § 2 says a `cid:` URL carries.
+//
+// ```novo
+// use mailmime
+// use mailctype
+//
+// fn main() [io]
+//     let p = mailmime.leaf_part(mailctype.default_content_type(), mailxfer.span(0, 0))
+//     match mailmime.part_by_content_id(p, "logo@example.com")
+//         Some(_) => println("found")
+//         None    => println("no such part")
+// ```
+pub fn part_by_content_id(p: MailPart, content_id: Str) -> ?MailPart
+    todo("mail-nv.mailmime.part_by_content_id")
+
+// The file name a part should be saved under, or `""`.
+//
+// Read from `Content-Disposition`'s `filename` parameter first and
+// `Content-Type`'s `name` parameter second, which is the order every
+// mail client uses and the order RFC 2183 § 2.3 implies.  The value is
+// the sender's, unsanitised: see the note on
+// `mailctype.filename_of`.
+//
+// ```novo
+// use mailmime
+// use mailctype
+//
+// fn main() [io]
+//     let p = mailmime.leaf_part(mailctype.default_content_type(), mailxfer.span(0, 0))
+//     println("[${mailmime.filename_of(p)}]")           // []
+// ```
+pub fn filename_of(p: MailPart) -> Str
+    todo("mail-nv.mailmime.filename_of")
+
+// A boundary string that does not occur in these octets.
+//
+// A builder needs one before it can write a multipart, and RFC 2046
+// § 5.1.1 requires that it not appear anywhere in the enclosed parts.
+// The `seed` makes the choice deterministic: this package has no
+// randomness, and a caller that wants an unpredictable boundary passes
+// a value from its own `[rand]`.
+//
+// ```novo
+// use mailmime
+//
+// fn main() [io]
+//     println("${str.len(mailmime.fresh_boundary(bytes.from_str("body"), 7))}")
+// ```
+pub fn fresh_boundary(content: Bytes, seed: Int) -> Str
+    todo("mail-nv.mailmime.fresh_boundary")
+
+// The part written back as message octets: its headers, a blank line,
+// and its body encoded, with children separated by the boundary its
+// type names.
+//
+// `MailMissingBoundary` when a `multipart/*` part has no `boundary`
+// parameter.  The source is needed because a part's body is a span
+// into it; a part a builder made carries its octets in `source`
+// instead, which is why `mailmsg.build` takes both.
+//
+// ```novo
+// use mailmime
+// use mailctype
+//
+// fn main() [io]
+//     let p = mailmime.leaf_part(mailctype.default_content_type(), mailxfer.span(0, 2))
+//     match mailmime.format_part(bytes.from_str("hi"), p)
+//         Ok(s)  => println("${str.len(s)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn format_part(source: Bytes, p: MailPart) -> Result<Str, mailerror.MailError>
+    todo("mail-nv.mailmime.format_part")

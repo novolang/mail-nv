@@ -1,0 +1,437 @@
+// mailhdr.nv — the header section: the fields as they were written,
+// and the four field bodies that have a grammar worth a type.
+//
+// A HEADER FIELD IS A NAME, A COLON AND A BODY
+//
+// RFC 5322 § 2.2 is that simple, and everything difficult about a mail
+// header follows from two additions to it.
+//
+// FOLDING.  A field body may be broken across lines at any point where
+// whitespace is allowed, by inserting a CRLF before the whitespace
+// (§ 2.2.3).  The line break is not part of the value; removing it is
+// called unfolding, and it must happen before anything parses the
+// body.  A parser that forgets sees a `Subject:` that stops at the
+// first wrap and a `To:` that has lost half its recipients.
+//
+// ORDER AND DUPLICATION.  Fields keep the order they arrived in, and
+// `Received:` appears once per hop with the newest FIRST.  So the
+// header section is a LIST of fields here, not a map.  A map would
+// lose the trace, lose the order a signature is computed over, and
+// silently drop one of the two `From:` fields that a malformed message
+// carries — which is precisely the ambiguity that mail filter evasion
+// is built on.  `MailHeaders` is therefore a list with lookups over
+// it, and `field_count` exists so a caller can refuse a message with
+// two `From:` fields rather than picking one.
+//
+// FOUR BODIES WITH A GRAMMAR
+//
+// `Date:` is RFC 5322 § 3.3's `date-time`, which is a civil date, a
+// time, and a ZONE OFFSET — not a zone name.  A `core` package has no
+// clock and no time zone database, so `MailDateTime` is exactly that:
+// calendar-nv's `CivilDateTime` and an offset in minutes.  Converting
+// it to an instant needs a caller who knows what an instant is.
+//
+// `Message-ID:`, `In-Reply-To:` and `References:` are § 3.6.4's
+// `msg-id`, which is an `addr-spec` inside angle brackets.  They are
+// the thread, and a threading algorithm that parses them with a
+// substring search is one that threads a message onto the wrong
+// conversation when a subject line contains a `<`.
+
+use civil
+use mailaddr
+use mailerror
+
+// One header field, as it was written.
+//
+// ```novo
+// use mailhdr
+//
+// fn main() [io]
+//     println(mailhdr.field("Subject", "Hello").name)
+// ```
+pub struct MailField
+    // The field name, with the case the sender used.  RFC 5322 § 1.2.2
+    // makes the name case-insensitive, and the case is kept because
+    // dkim-nv signs the header as it was written and a rewritten name
+    // breaks the signature.
+    name: Str
+    // The field body, UNFOLDED and with the leading space after the
+    // colon removed, but not otherwise decoded: encoded words are
+    // still encoded, and `mailword.decode_text` is what removes them.
+    value: Str
+    // The offset in the message's bytes where this field's name
+    // starts, or `-1` for a field a builder made.  A signature
+    // verifier and an error report both need it.
+    offset: Int
+
+// The whole header section of a message or a body part.
+//
+// ```novo
+// use mailhdr
+//
+// fn main() [io]
+//     let h = mailhdr.headers([mailhdr.field("Subject", "Hello")])
+//     println(mailhdr.value_of(h, "subject"))          // Hello
+// ```
+pub struct MailHeaders
+    // The fields, in the order they appeared.
+    fields: [MailField]
+
+// A date and time as a mail header writes it: a civil date and time,
+// and the offset from UTC in minutes.
+//
+// An offset and not a zone name, because RFC 5322 § 3.3 carries an
+// offset and nothing else.  `-0000` is a real and different thing from
+// `+0000`: the specification says it means the time was generated on a
+// system in an unknown zone, so `offset_known` carries that fact
+// rather than turning it into zero.
+//
+// ```novo
+// use mailhdr
+// use civil
+//
+// fn main() [io]
+//     let d = civil.date(2026, 9, 17)!
+//     let t = civil.time_of(9, 30, 0, 0)!
+//     println("${mailhdr.datetime(civil.datetime(d, t), 60).offset_minutes}")
+// ```
+pub struct MailDateTime
+    // The local date and time the sender wrote.
+    local: civil.CivilDateTime
+    // Minutes east of UTC: `60` for `+0100`, `-300` for `-0500`.
+    offset_minutes: Int
+    // False when the sender wrote `-0000`, which RFC 5322 § 3.3 says
+    // means the zone is unknown.  `offset_minutes` is then zero and a
+    // caller must not treat the time as UTC.
+    offset_known: Bool
+
+// A message identifier, RFC 5322 § 3.6.4's `msg-id`.
+//
+// Held as its two halves, without the angle brackets, because that is
+// what comparison needs: two identifiers are the same when both halves
+// match, and the brackets are punctuation.
+//
+// ```novo
+// use mailhdr
+//
+// fn main() [io]
+//     println(mailhdr.format_message_id(mailhdr.message_id("abc123", "example.com")))
+// ```
+pub struct MailMessageId
+    // The part before the `@`.
+    id_left: Str
+    // The part after it.
+    id_right: Str
+
+// A field.
+//
+// ```novo
+// use mailhdr
+//
+// fn main() [io]
+//     println(mailhdr.field("To", "ada@example.com").value)
+// ```
+pub fn field(name: Str, value: Str) -> MailField
+    todo("mail-nv.mailhdr.field")
+
+// A header section from a list of fields.
+//
+// ```novo
+// use mailhdr
+//
+// fn main() [io]
+//     println("${list.len(mailhdr.headers([]).fields)}")     // 0
+// ```
+pub fn headers(fields: [MailField]) -> MailHeaders
+    todo("mail-nv.mailhdr.headers")
+
+// The header section parsed from the bytes of a message or a part.
+//
+// Reads up to and including the empty line RFC 5322 § 2.1 puts before
+// the body, unfolds every field, and answers the offset at which the
+// body begins.  `MailHeadersUnterminated` when the empty line never
+// arrives.
+//
+// ```novo
+// use mailhdr
+//
+// fn main() [io]
+//     match mailhdr.parse_headers(bytes.from_str("Subject: Hi\r\n\r\nbody"), 0)
+//         Ok(p)  => println("${p.body_offset}")
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_headers(source: Bytes,
+                     from_offset: Int) -> Result<MailParsedHeaders, mailerror.MailError>
+    todo("mail-nv.mailhdr.parse_headers")
+
+// The header section and where the body starts after it.
+//
+// ```novo
+// use mailhdr
+//
+// fn main() [io]
+//     match mailhdr.parse_headers(bytes.from_str("A: b\r\n\r\n"), 0)
+//         Ok(p)  => println("${list.len(p.headers.fields)}")
+//         Err(e) => println(e.message())
+// ```
+pub struct MailParsedHeaders
+    // The fields that were read.
+    headers: MailHeaders
+    // The offset of the first octet after the blank line.
+    body_offset: Int
+
+// The body of the first field with this name, or `""`.
+//
+// The name is matched case-insensitively, as RFC 5322 § 1.2.2
+// requires.  The first match wins because that is what receivers do,
+// and `field_count` is how a caller detects the duplicate before
+// trusting the answer.
+//
+// ```novo
+// use mailhdr
+//
+// fn main() [io]
+//     let h = mailhdr.headers([mailhdr.field("Subject", "Hi")])
+//     println(mailhdr.value_of(h, "SUBJECT"))               // Hi
+// ```
+pub fn value_of(h: MailHeaders, name: Str) -> Str
+    todo("mail-nv.mailhdr.value_of")
+
+// Every field with this name, in order.
+//
+// What `Received:` needs, and what a DKIM verifier needs when a
+// message carries several `DKIM-Signature:` fields.
+//
+// ```novo
+// use mailhdr
+//
+// fn main() [io]
+//     let h = mailhdr.headers([mailhdr.field("Received", "from a"), mailhdr.field("Received", "from b")])
+//     println("${list.len(mailhdr.values_of(h, "received"))}")   // 2
+// ```
+pub fn values_of(h: MailHeaders, name: Str) -> [Str]
+    todo("mail-nv.mailhdr.values_of")
+
+// How many fields carry this name.
+//
+// RFC 5322 § 3.6 allows `From:`, `Date:`, `Subject:` and
+// `Message-ID:` at most once each.  A message with two is malformed
+// and is also how a filter is evaded — one parser reads the first and
+// another reads the second — so a caller that cares can refuse it, and
+// this is the function that lets it.
+//
+// ```novo
+// use mailhdr
+//
+// fn main() [io]
+//     let h = mailhdr.headers([mailhdr.field("From", "a@b.c")])
+//     println("${mailhdr.field_count(h, "from")}")          // 1
+// ```
+pub fn field_count(h: MailHeaders, name: Str) -> Int
+    todo("mail-nv.mailhdr.field_count")
+
+// The header section with a field appended at the end.
+//
+// ```novo
+// use mailhdr
+//
+// fn main() [io]
+//     let h = mailhdr.append(mailhdr.headers([]), mailhdr.field("Subject", "Hi"))
+//     println("${list.len(h.fields)}")                      // 1
+// ```
+pub fn append(h: MailHeaders, f: MailField) -> MailHeaders
+    todo("mail-nv.mailhdr.append")
+
+// The header section with a field prepended at the front.
+//
+// Where a `Received:` field goes: RFC 5321 § 4.4 requires each relay
+// to add its trace at the TOP, so the newest hop is first and the
+// order of the list is the route in reverse.
+//
+// ```novo
+// use mailhdr
+//
+// fn main() [io]
+//     let h = mailhdr.prepend(mailhdr.headers([]), mailhdr.field("Received", "from a"))
+//     println(h.fields[0].name)                             // Received
+// ```
+pub fn prepend(h: MailHeaders, f: MailField) -> MailHeaders
+    todo("mail-nv.mailhdr.prepend")
+
+// The header section with every field of this name removed.
+//
+// ```novo
+// use mailhdr
+//
+// fn main() [io]
+//     let h = mailhdr.without(mailhdr.headers([mailhdr.field("Bcc", "a@b.c")]), "bcc")
+//     println("${list.len(h.fields)}")                      // 0
+// ```
+pub fn without(h: MailHeaders, name: Str) -> MailHeaders
+    todo("mail-nv.mailhdr.without")
+
+// A field body with its folding whitespace removed: every CRLF that is
+// followed by a space or a tab is deleted, and nothing else changes.
+//
+// RFC 5322 § 2.2.3.  This is the first thing done to every field body,
+// and the reason `MailField.value` is already unfolded.
+//
+// ```novo
+// use mailhdr
+//
+// fn main() [io]
+//     println(mailhdr.unfold("Hello\r\n world"))            // Hello world
+// ```
+pub fn unfold(value: Str) -> Str
+    todo("mail-nv.mailhdr.unfold")
+
+// A field body folded to fit the 78 octet line RFC 2822 § 2.1.1
+// recommends, breaking only at whitespace outside a quoted string.
+//
+// `limit` is the octet count a line may reach, and 78 is the value to
+// pass unless a caller is reproducing a specific message.  A body with
+// no whitespace to fold at is emitted over-length rather than broken,
+// because a fold inside a token produces a value the receiver cannot
+// parse and a long line is merely discouraged.
+//
+// ```novo
+// use mailhdr
+//
+// fn main() [io]
+//     println(mailhdr.fold("Subject", "a short one", 78))
+// ```
+pub fn fold(name: Str, value: Str, limit: Int) -> Str
+    todo("mail-nv.mailhdr.fold")
+
+// The whole header section written back, each field folded, with the
+// terminating empty line.
+//
+// ```novo
+// use mailhdr
+//
+// fn main() [io]
+//     println(mailhdr.format_headers(mailhdr.headers([mailhdr.field("Subject", "Hi")])))
+// ```
+pub fn format_headers(h: MailHeaders) -> Str
+    todo("mail-nv.mailhdr.format_headers")
+
+// A date and time with an offset in minutes east of UTC.
+//
+// ```novo
+// use mailhdr
+// use civil
+//
+// fn main() [io]
+//     let dt = civil.datetime(civil.date(2026, 9, 17)!, civil.midnight())
+//     println("${mailhdr.datetime(dt, 0).offset_known}")    // true
+// ```
+pub fn datetime(local: civil.CivilDateTime, offset_minutes: Int) -> MailDateTime
+    todo("mail-nv.mailhdr.datetime")
+
+// A `Date:` field body parsed, RFC 5322 § 3.3.
+//
+// The obsolete forms of § 4.3 are accepted on the way in, because they
+// are in the archives: a two-digit year, the alphabetic zone names
+// `UT`, `GMT`, `EST` and the military single letters, and comments
+// between the components.  They are never written back out.
+//
+// ```novo
+// use mailhdr
+//
+// fn main() [io]
+//     match mailhdr.parse_date("Fri, 21 Nov 1997 09:55:06 -0600")
+//         Ok(d)  => println("${d.offset_minutes}")          // -360
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_date(value: Str) -> Result<MailDateTime, mailerror.MailError>
+    todo("mail-nv.mailhdr.parse_date")
+
+// A `Date:` field body written, in the one form RFC 5322 § 3.3
+// specifies: `Fri, 21 Nov 1997 09:55:06 -0600`.
+//
+// The day name is computed from the date rather than taken from a
+// field, so a value that round-trips cannot come back with a day name
+// that disagrees with its date.
+//
+// ```novo
+// use mailhdr
+// use civil
+//
+// fn main() [io]
+//     let dt = civil.datetime(civil.date(1997, 11, 21)!, civil.time_of(9, 55, 6, 0)!)
+//     println(mailhdr.format_date(mailhdr.datetime(dt, -360)))
+// ```
+pub fn format_date(d: MailDateTime) -> Str
+    todo("mail-nv.mailhdr.format_date")
+
+// A message identifier from its two halves.
+//
+// ```novo
+// use mailhdr
+//
+// fn main() [io]
+//     println(mailhdr.message_id("abc", "example.com").id_right)
+// ```
+pub fn message_id(id_left: Str, id_right: Str) -> MailMessageId
+    todo("mail-nv.mailhdr.message_id")
+
+// A `Message-ID:` field body parsed: one `msg-id` in angle brackets.
+//
+// ```novo
+// use mailhdr
+//
+// fn main() [io]
+//     match mailhdr.parse_message_id("<abc@example.com>")
+//         Ok(m)  => println(m.id_left)                      // abc
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_message_id(value: Str) -> Result<MailMessageId, mailerror.MailError>
+    todo("mail-nv.mailhdr.parse_message_id")
+
+// A `References:` or `In-Reply-To:` field body parsed: a sequence of
+// `msg-id`, in order.
+//
+// The obsolete syntax of § 4.5.4 allowed a `phrase` between them, and
+// it is skipped rather than refused, because a thread that breaks on
+// an old message is a thread that breaks.
+//
+// ```novo
+// use mailhdr
+//
+// fn main() [io]
+//     match mailhdr.parse_message_ids("<a@x> <b@x>")
+//         Ok(ms) => println("${list.len(ms)}")              // 2
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_message_ids(value: Str) -> Result<[MailMessageId], mailerror.MailError>
+    todo("mail-nv.mailhdr.parse_message_ids")
+
+// A message identifier written back, brackets included.
+//
+// ```novo
+// use mailhdr
+//
+// fn main() [io]
+//     println(mailhdr.format_message_id(mailhdr.message_id("abc", "example.com")))
+// ```
+pub fn format_message_id(m: MailMessageId) -> Str
+    todo("mail-nv.mailhdr.format_message_id")
+
+// The addresses in a named field, parsed.
+//
+// `From:`, `To:`, `Cc:`, `Bcc:`, `Reply-To:`, `Sender:` — the fields
+// RFC 5322 § 3.6.2 and § 3.6.3 give the address grammar.  An absent
+// field answers an empty list, because "nobody was named" and "the
+// field was not there" lead to the same behaviour in every caller.
+//
+// ```novo
+// use mailhdr
+//
+// fn main() [io]
+//     let h = mailhdr.headers([mailhdr.field("To", "ada@example.com")])
+//     match mailhdr.addresses_of(h, "to")
+//         Ok(es) => println("${list.len(es)}")              // 1
+//         Err(e) => println(e.message())
+// ```
+pub fn addresses_of(h: MailHeaders, name: Str) -> Result<[mailaddr.MailEntry], mailerror.MailError>
+    todo("mail-nv.mailhdr.addresses_of")

@@ -1,0 +1,395 @@
+// mailctype.nv — `Content-Type`, `Content-Disposition` and
+// `Content-Transfer-Encoding`: the three fields that say what a body
+// part is, what to do with it, and how its octets were armoured.
+//
+// A MEDIA TYPE IS A TYPE, A SUBTYPE AND PARAMETERS
+//
+// RFC 2045 § 5.1 gives `Content-Type` the grammar
+// `type "/" subtype *(";" parameter)`.  The type and the subtype are
+// case-insensitive and are held lowercased here.  A parameter name is
+// case-insensitive; a parameter VALUE is not, and `boundary` is the
+// one where that matters most — two boundaries differing only in case
+// are two different boundaries, and a parser that folded them would
+// split a message in the wrong place.
+//
+// PARAMETERS ARE A LIST, NOT A MAP
+//
+// `MailContentType.params` is a list of `MailParam` in the order they
+// were written.  A map would be smaller and would lose two things this
+// package needs: the order, which `dkim-nv` needs to reproduce a
+// header octet for octet when it verifies a signature over it, and the
+// duplicates, which are illegal and are therefore worth being able to
+// SEE rather than silently dropping one of.  `param_value` is the
+// lookup, and it answers the first match, which is what every
+// implementation does with a duplicate.
+//
+// RFC 2231 IS HANDLED ON THE WAY IN
+//
+// A `filename*0*=utf-8''...` parameter set is assembled by `mailword`
+// before a `MailParam` exists, so `param_value("filename")` answers
+// the finished text and no caller ever meets a section number.  The
+// raw sections are still reachable through `raw_params`, for the same
+// reproduce-it-exactly reason the order is kept.
+
+use mailerror
+
+// One `Content-Type` or `Content-Disposition` parameter.
+//
+// ```novo
+// use mailctype
+//
+// fn main() [io]
+//     println(mailctype.param("charset", "utf-8").name)   // charset
+// ```
+pub struct MailParam
+    // The parameter name, lowercased.  RFC 2045 § 5.1 makes it
+    // case-insensitive.
+    name: Str
+    // The value, with quoting removed and any RFC 2231 continuation
+    // already assembled and decoded.  Case is preserved.
+    value: Str
+
+// A parsed media type.
+//
+// ```novo
+// use mailctype
+//
+// fn main() [io]
+//     let ct = mailctype.content_type("text", "plain", [mailctype.param("charset", "utf-8")])
+//     println("${ct.type_name}/${ct.subtype}")            // text/plain
+// ```
+pub struct MailContentType
+    // The top-level type, lowercased: `text`, `multipart`, `image`,
+    // `application`, `message`.
+    type_name: Str
+    // The subtype, lowercased: `plain`, `mixed`, `rfc822`.
+    subtype: Str
+    // The parameters, in the order they were written.
+    params: [MailParam]
+
+// What a part is meant to be done with, RFC 2183.
+//
+// ```novo
+// use mailctype
+//
+// fn main() [io]
+//     println(mailctype.disposition_name(MailAttachmentDisposition))   // attachment
+// ```
+pub enum MailDispositionKind
+    // Shown as part of the message.  RFC 2183 § 2.1.
+    MailInlineDisposition
+    // Offered as a separate file.  RFC 2183 § 2.2.
+    MailAttachmentDisposition
+    // A disposition type this package does not know, carried as
+    // written.  RFC 2183 § 2.8 requires treating an unknown one as
+    // `attachment`, and `disposition_is_attachment` is where that rule
+    // is applied — the value itself is kept so nothing is lost.
+    MailOtherDisposition(name: Str)
+
+// A parsed `Content-Disposition` field.
+//
+// ```novo
+// use mailctype
+//
+// fn main() [io]
+//     let d = mailctype.disposition(MailInlineDisposition, [])
+//     println(mailctype.disposition_name(d.kind))         // inline
+// ```
+pub struct MailDisposition
+    // Inline, attachment, or something else.
+    kind: MailDispositionKind
+    // Its parameters: `filename`, `size`, `creation-date`,
+    // `modification-date`.
+    params: [MailParam]
+
+// How a body part's octets were armoured for transport, RFC 2045 § 6.
+//
+// ```novo
+// use mailctype
+//
+// fn main() [io]
+//     println(mailctype.transfer_encoding_name(MailBase64Encoding))    // base64
+// ```
+pub enum MailTransferEncoding
+    // `7bit`: the body is already US-ASCII with no long lines.  The
+    // default when the field is absent (RFC 2045 § 6.1).
+    MailSevenBit
+    // `8bit`: lines of at most 998 octets, any of which may have the
+    // high bit set.
+    MailEightBit
+    // `binary`: no line structure at all.
+    MailBinary
+    // `quoted-printable`, RFC 2045 § 6.7.
+    MailQuotedPrintable
+    // `base64`, RFC 2045 § 6.8.
+    MailBase64Encoding
+
+// A parameter.
+//
+// ```novo
+// use mailctype
+//
+// fn main() [io]
+//     println(mailctype.param("boundary", "sep").value)   // sep
+// ```
+pub fn param(name: Str, value: Str) -> MailParam
+    todo("mail-nv.mailctype.param")
+
+// A media type from its parts.
+//
+// ```novo
+// use mailctype
+//
+// fn main() [io]
+//     println(mailctype.format_content_type(mailctype.content_type("text", "plain", [])))
+// ```
+pub fn content_type(type_name: Str, subtype: Str, params: [MailParam]) -> MailContentType
+    todo("mail-nv.mailctype.content_type")
+
+// `text/plain; charset=us-ascii`, the type RFC 2045 § 5.2 says a part
+// with no `Content-Type` field has.
+//
+// A parser applies it rather than leaving the field absent, so every
+// part a caller meets has a type and no caller writes the default
+// again.
+//
+// ```novo
+// use mailctype
+//
+// fn main() [io]
+//     println(mailctype.default_content_type().subtype)   // plain
+// ```
+pub fn default_content_type() -> MailContentType
+    todo("mail-nv.mailctype.default_content_type")
+
+// A `Content-Type` field value parsed.
+//
+// `MailBadContentType` when the grammar fails, naming the part that
+// did.  RFC 2231 continuations are assembled before the result is
+// built.
+//
+// ```novo
+// use mailctype
+//
+// fn main() [io]
+//     match mailctype.parse_content_type("multipart/mixed; boundary=\"sep\"")
+//         Ok(ct) => println(ct.subtype)                   // mixed
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_content_type(value: Str) -> Result<MailContentType, mailerror.MailError>
+    todo("mail-nv.mailctype.parse_content_type")
+
+// A media type written back as a field value, quoted and folded.
+//
+// A parameter value is quoted when it holds a `tspecials` character
+// (RFC 2045 § 5.1), and encoded as RFC 2231 sections when it is not
+// ASCII or would make the line too long.
+//
+// ```novo
+// use mailctype
+//
+// fn main() [io]
+//     println(mailctype.format_content_type(mailctype.content_type("image", "png", [])))
+// ```
+pub fn format_content_type(ct: MailContentType) -> Str
+    todo("mail-nv.mailctype.format_content_type")
+
+// The value of a named parameter, or `""`.
+//
+// The name is matched case-insensitively and the FIRST match wins,
+// which is what receivers do with the duplicate that RFC 2045 forbids
+// and senders occasionally emit.
+//
+// ```novo
+// use mailctype
+//
+// fn main() [io]
+//     let ct = mailctype.content_type("text", "plain", [mailctype.param("charset", "utf-8")])
+//     println(mailctype.param_value(ct, "CHARSET"))       // utf-8
+// ```
+pub fn param_value(ct: MailContentType, name: Str) -> Str
+    todo("mail-nv.mailctype.param_value")
+
+// The media type with a parameter added, or replaced when it is
+// already there.
+//
+// ```novo
+// use mailctype
+//
+// fn main() [io]
+//     let ct = mailctype.with_param(mailctype.content_type("text", "plain", []), "charset", "utf-8")
+//     println(mailctype.param_value(ct, "charset"))       // utf-8
+// ```
+pub fn with_param(ct: MailContentType, name: Str, value: Str) -> MailContentType
+    todo("mail-nv.mailctype.with_param")
+
+// The `charset` parameter as a `mailword.MailCharset` name, or
+// `"us-ascii"` when there is none.
+//
+// RFC 2046 § 4.1.2 makes `us-ascii` the default for `text/*`, and a
+// caller that had to write that default itself would eventually write
+// something else.
+//
+// ```novo
+// use mailctype
+//
+// fn main() [io]
+//     println(mailctype.charset_of(mailctype.content_type("text", "plain", [])))
+// ```
+pub fn charset_of(ct: MailContentType) -> Str
+    todo("mail-nv.mailctype.charset_of")
+
+// The `boundary` parameter of a `multipart/*` type, or `""`.
+//
+// RFC 2046 § 5.1.1 requires it on every multipart, and its absence is
+// `MailMissingBoundary` when the tree is built — not here, because
+// this function answers a question about a value and the refusal
+// belongs where the body is walked.
+//
+// ```novo
+// use mailctype
+//
+// fn main() [io]
+//     let ct = mailctype.content_type("multipart", "mixed", [mailctype.param("boundary", "sep")])
+//     println(mailctype.boundary_of(ct))                  // sep
+// ```
+pub fn boundary_of(ct: MailContentType) -> Str
+    todo("mail-nv.mailctype.boundary_of")
+
+// Whether the type is `multipart/*` — a part whose body is other
+// parts.
+//
+// ```novo
+// use mailctype
+//
+// fn main() [io]
+//     println("${mailctype.is_multipart(mailctype.content_type("multipart", "mixed", []))}")
+// ```
+pub fn is_multipart(ct: MailContentType) -> Bool
+    todo("mail-nv.mailctype.is_multipart")
+
+// Whether the type is `message/rfc822` or `message/global` — a part
+// whose body is a whole message.
+//
+// ```novo
+// use mailctype
+//
+// fn main() [io]
+//     println("${mailctype.is_message(mailctype.content_type("message", "rfc822", []))}")
+// ```
+pub fn is_message(ct: MailContentType) -> Bool
+    todo("mail-nv.mailctype.is_message")
+
+// A disposition from its parts.
+//
+// ```novo
+// use mailctype
+//
+// fn main() [io]
+//     println(mailctype.disposition_name(mailctype.disposition(MailInlineDisposition, []).kind))
+// ```
+pub fn disposition(kind: MailDispositionKind, params: [MailParam]) -> MailDisposition
+    todo("mail-nv.mailctype.disposition")
+
+// A `Content-Disposition` field value parsed.
+//
+// ```novo
+// use mailctype
+//
+// fn main() [io]
+//     match mailctype.parse_disposition("attachment; filename=\"a.txt\"")
+//         Ok(d)  => println(mailctype.filename_of(d))     // a.txt
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_disposition(value: Str) -> Result<MailDisposition, mailerror.MailError>
+    todo("mail-nv.mailctype.parse_disposition")
+
+// A disposition written back as a field value.
+//
+// ```novo
+// use mailctype
+//
+// fn main() [io]
+//     println(mailctype.format_disposition(mailctype.disposition(MailInlineDisposition, [])))
+// ```
+pub fn format_disposition(d: MailDisposition) -> Str
+    todo("mail-nv.mailctype.format_disposition")
+
+// The name a disposition kind is written with: `"inline"`,
+// `"attachment"`, or whatever an unknown one carried.
+//
+// ```novo
+// use mailctype
+//
+// fn main() [io]
+//     println(mailctype.disposition_name(MailOtherDisposition("form-data")))
+// ```
+pub fn disposition_name(k: MailDispositionKind) -> Str
+    todo("mail-nv.mailctype.disposition_name")
+
+// Whether a part should be offered as a file rather than shown.
+//
+// True for `attachment`, true for every unknown disposition type — RFC
+// 2183 § 2.8 requires treating one that way — and true for `inline`
+// when a `filename` parameter is present, which is what mail clients
+// do and what a caller extracting attachments expects.
+//
+// ```novo
+// use mailctype
+//
+// fn main() [io]
+//     let d = mailctype.disposition(MailOtherDisposition("x-thing"), [])
+//     println("${mailctype.disposition_is_attachment(d)}")   // true
+// ```
+pub fn disposition_is_attachment(d: MailDisposition) -> Bool
+    todo("mail-nv.mailctype.disposition_is_attachment")
+
+// The `filename` parameter, assembled from its RFC 2231 sections if it
+// had any, or `""`.
+//
+// The value is returned as the sender wrote it, with no path
+// separators removed.  A caller writing it to disk must sanitise it:
+// a `filename` of `../../etc/passwd` is a thing senders send, and this
+// package has no file system and cannot know what is safe where the
+// caller is.
+//
+// ```novo
+// use mailctype
+//
+// fn main() [io]
+//     let d = mailctype.disposition(MailAttachmentDisposition, [mailctype.param("filename", "a.txt")])
+//     println(mailctype.filename_of(d))                   // a.txt
+// ```
+pub fn filename_of(d: MailDisposition) -> Str
+    todo("mail-nv.mailctype.filename_of")
+
+// The transfer encoding a `Content-Transfer-Encoding` value names.
+//
+// Matched case-insensitively.  `MailUnknownTransferEncoding` for
+// anything else, naming what was written — RFC 2045 § 6.4 says a
+// receiver that does not know the mechanism must not decode the body,
+// and returning the name is how a caller reports what it could not
+// read.
+//
+// ```novo
+// use mailctype
+//
+// fn main() [io]
+//     match mailctype.parse_transfer_encoding("Base64")
+//         Ok(_)  => println("base64")
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_transfer_encoding(value: Str) -> Result<MailTransferEncoding, mailerror.MailError>
+    todo("mail-nv.mailctype.parse_transfer_encoding")
+
+// The name a transfer encoding is written with: `"7bit"`, `"8bit"`,
+// `"binary"`, `"quoted-printable"`, `"base64"`.
+//
+// ```novo
+// use mailctype
+//
+// fn main() [io]
+//     println(mailctype.transfer_encoding_name(MailSevenBit))   // 7bit
+// ```
+pub fn transfer_encoding_name(e: MailTransferEncoding) -> Str
+    todo("mail-nv.mailctype.transfer_encoding_name")

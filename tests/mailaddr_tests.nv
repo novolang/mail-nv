@@ -1,0 +1,112 @@
+// mailaddr_tests.nv — the address grammar of RFC 5322 § 3.4, against
+// the examples the specification itself prints.
+//
+// RED ON PURPOSE: every assertion reaches `not implemented:
+// mail-nv.mailaddr.<fn>`.  The suite is the specification the
+// implementation will have to satisfy.
+
+use std.test
+use mailaddr
+
+// RFC 5322 § A.1.1's message, whose `From:` is one named mailbox.
+fn a1_1_from() -> Str
+    "John Doe <jdoe@machine.example>"
+
+// RFC 5322 § A.1.3's `To:`, a group with three members.
+fn a1_3_to() -> Str
+    "A Group:Chris Jones <c@a.test>,joe@where.test,John <jdoe@one.test>;"
+
+@test
+fn test_a_mailbox_is_a_name_and_an_addr_spec() [io]
+    test.case("RFC 5322 A.1.1 — John Doe <jdoe@machine.example>")
+    match mailaddr.parse_address(a1_1_from())
+        Ok(a)  =>
+            test.assert_eq_str(a.display_name, "John Doe")
+            test.assert_eq_str(a.local_part, "jdoe")
+            test.assert_eq_str(a.domain, "machine.example")
+        Err(e) => test.fail(e.message())
+
+    test.case("a bare addr-spec has no display name")
+    match mailaddr.parse_address("jdoe@machine.example")
+        Ok(a)  => test.assert_eq_str(a.display_name, "")
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_group_holds_mailboxes_and_may_be_empty() [io]
+    test.case("RFC 5322 A.1.3 — a group of three")
+    match mailaddr.parse_entries(a1_3_to())
+        Ok(es) =>
+            test.assert_eq(list.len(es), 1)
+            test.assert_eq(list.len(mailaddr.mailboxes_of(es)), 3)
+        Err(e) => test.fail(e.message())
+
+    test.case("undisclosed-recipients:; is a group with no members")
+    match mailaddr.parse_entries("undisclosed-recipients:;")
+        Ok(es) => test.assert_eq(list.len(mailaddr.mailboxes_of(es)), 0)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_the_domain_folds_case_and_the_local_part_does_not() [io]
+    // RFC 5321 § 2.4: the domain is case-insensitive, and the meaning
+    // of the local part is the receiving host's business.  A library
+    // that folded both would merge two mailboxes on every host that
+    // distinguishes them.
+    test.case("Ada@Example.COM and Ada@example.com are one mailbox")
+    let upper = mailaddr.addr_spec("Ada", "Example.COM")
+    let lower = mailaddr.addr_spec("Ada", "example.com")
+    test.assert(mailaddr.same_mailbox(upper, lower))
+
+    test.case("ada@example.com and Ada@example.com are not")
+    test.assert_false(mailaddr.same_mailbox(mailaddr.addr_spec("ada", "example.com"), lower),
+                      "the local part is compared exactly")
+
+    test.case("and the parsed domain is lowercased")
+    match mailaddr.parse_address("a@Example.COM")
+        Ok(a)  => test.assert_eq_str(a.domain, "example.com")
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_an_address_round_trips_through_its_own_formatter() [io]
+    test.case("a named address is written back as Name <local@domain>")
+    let a = mailaddr.named_address("Ada Lovelace", "ada", "example.com")
+    test.assert_eq_str(mailaddr.format_address(a), "Ada Lovelace <ada@example.com>")
+
+    test.case("a bare one is written back without brackets")
+    test.assert_eq_str(mailaddr.format_addr_spec(mailaddr.addr_spec("ada", "example.com")),
+                       "ada@example.com")
+
+    test.case("and a group is written back with its semicolon")
+    let g = MailGroupOf(mailaddr.group("Friends", [mailaddr.addr_spec("ada", "example.com")]))
+    test.assert(str.ends_with(mailaddr.format_entries([g]), ";"))
+
+@test
+fn test_a_local_part_outside_atext_is_quoted() [io]
+    // RFC 5322 § 3.2.4: a local part holding anything outside `atext`
+    // has to be a quoted string, and a builder that forgot would emit
+    // an address no receiver can parse.
+    test.case("a space in the local part forces quoting")
+    let odd = mailaddr.addr_spec("john smith", "example.com")
+    test.assert(str.starts_with(mailaddr.format_addr_spec(odd), "\""))
+
+@test
+fn test_syntax_validity_says_nothing_about_deliverability() [io]
+    test.case("a well-formed addr-spec is valid")
+    test.assert(mailaddr.is_valid_addr_spec("ada@example.com"))
+
+    test.case("a missing domain is not")
+    test.assert_false(mailaddr.is_valid_addr_spec("ada@"), "no domain")
+
+    test.case("two at signs are not")
+    test.assert_false(mailaddr.is_valid_addr_spec("a@b@c"), "two at signs")
+
+@test
+fn test_a_malformed_address_is_refused_with_a_position() [io]
+    test.case("a bare word is not a mailbox")
+    match mailaddr.parse_address("not an address")
+        Ok(_)  => test.fail("`not an address` has no at sign")
+        Err(e) => test.assert(str.len(e.message()) > 0)
+
+    test.case("and two mailboxes are not one")
+    match mailaddr.parse_address("a@b.c, d@e.f")
+        Ok(_)  => test.fail("parse_address takes exactly one mailbox")
+        Err(e) => test.assert(str.len(e.message()) > 0)

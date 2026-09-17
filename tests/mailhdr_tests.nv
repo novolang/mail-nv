@@ -1,0 +1,181 @@
+// mailhdr_tests.nv — the header section: folding, order, and the field
+// bodies with a grammar.
+//
+// RED ON PURPOSE: every assertion reaches `not implemented:
+// mail-nv.mailhdr.<fn>`.
+
+use std.test
+use civil
+use mailhdr
+
+// RFC 5322 § A.1.1's date, which is the specification's own example of
+// `date-time` and carries a negative offset.
+fn a1_1_date() -> Str
+    "Fri, 21 Nov 1997 09:55:06 -0600"
+
+@test
+fn test_a_folded_field_is_one_value() [io]
+    // RFC 5322 § 2.2.3.  A parser that does not unfold sees a Subject
+    // that stops at the first wrap.
+    test.case("a CRLF before whitespace is removed and nothing else is")
+    test.assert_eq_str(mailhdr.unfold("Hello\r\n world"), "Hello world")
+
+    test.case("a CRLF that is not followed by whitespace is kept")
+    test.assert_eq_str(mailhdr.unfold("a\r\nb"), "a\r\nb")
+
+    test.case("and unfolding twice changes nothing")
+    test.assert_eq_str(mailhdr.unfold(mailhdr.unfold("a\r\n\tb")), "a\tb")
+
+@test
+fn test_a_long_field_is_folded_at_whitespace_only() [io]
+    test.case("a short field is emitted on one line")
+    test.assert_eq_str(mailhdr.fold("Subject", "Hi", 78), "Subject: Hi")
+
+    test.case("a long one gains a fold, and unfolding it gives the value back")
+    let long = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen"
+    let folded = mailhdr.fold("Subject", long, 78)
+    test.assert_eq_str(mailhdr.unfold(folded), "Subject: ${long}")
+
+    test.case("a value with nowhere to fold is emitted over-length rather than broken")
+    let unbreakable = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    test.assert_false(str.contains(mailhdr.fold("X-Token", unbreakable, 78), "\r\n "),
+                      "a fold inside a token is unparseable")
+
+@test
+fn test_the_header_section_keeps_its_order_and_its_duplicates() [io]
+    let h = mailhdr.headers([mailhdr.field("Received", "from b"),
+                             mailhdr.field("Received", "from a"),
+                             mailhdr.field("Subject", "Hi")])
+
+    test.case("every field of a name is reachable, in order")
+    test.assert_eq(list.len(mailhdr.values_of(h, "received")), 2)
+
+    test.case("the first match answers a single lookup")
+    test.assert_eq_str(mailhdr.value_of(h, "RECEIVED"), "from b")
+
+    test.case("and a duplicate is countable, so a caller can refuse it")
+    test.assert_eq(mailhdr.field_count(h, "received"), 2)
+    test.assert_eq(mailhdr.field_count(h, "from"), 0)
+
+@test
+fn test_a_trace_field_goes_on_the_top() [io]
+    // RFC 5321 § 4.4: each relay prepends its own Received, so the
+    // newest hop is first.
+    test.case("prepend puts the field at the front")
+    let h = mailhdr.prepend(mailhdr.headers([mailhdr.field("Subject", "Hi")]),
+                            mailhdr.field("Received", "from a"))
+    test.assert_eq_str(h.fields[0].name, "Received")
+
+    test.case("append puts it at the back")
+    let h2 = mailhdr.append(mailhdr.headers([mailhdr.field("Subject", "Hi")]),
+                            mailhdr.field("X-Spam", "no"))
+    test.assert_eq_str(h2.fields[1].name, "X-Spam")
+
+    test.case("and without removes every field of a name")
+    let h3 = mailhdr.without(mailhdr.headers([mailhdr.field("Bcc", "a@b.c"),
+                                              mailhdr.field("Bcc", "d@e.f")]),
+                                              "bcc")
+    test.assert_eq(list.len(h3.fields), 0)
+
+@test
+fn test_the_headers_end_at_the_blank_line() [io]
+    test.case("RFC 5322 § 2.1 — the body starts after the empty line")
+    match mailhdr.parse_headers(bytes.from_str("Subject: Hi\r\n\r\nbody"), 0)
+        Ok(p)  =>
+            test.assert_eq(list.len(p.headers.fields), 1)
+            test.assert_eq(p.body_offset, 15)
+        Err(e) => test.fail(e.message())
+
+    test.case("and a section that never ends is refused as truncated")
+    match mailhdr.parse_headers(bytes.from_str("Subject: Hi\r\n"), 0)
+        Ok(_)  => test.fail("there is no blank line")
+        Err(e) => test.assert(str.len(e.message()) > 0)
+
+@test
+fn test_a_date_carries_an_offset_and_not_a_zone() [io]
+    test.case("RFC 5322 A.1.1 — Fri, 21 Nov 1997 09:55:06 -0600")
+    match mailhdr.parse_date(a1_1_date())
+        Ok(d)  =>
+            test.assert_eq(d.local.date.year, 1997)
+            test.assert_eq(d.local.date.month, 11)
+            test.assert_eq(d.local.date.day, 21)
+            test.assert_eq(d.local.time.hour, 9)
+            test.assert_eq(d.offset_minutes, -360)
+            test.assert(d.offset_known)
+        Err(e) => test.fail(e.message())
+
+    test.case("and it is written back in the one form § 3.3 specifies")
+    let dt = civil.datetime(civil.date(1997, 11, 21)!, civil.time_of(9, 55, 6, 0)!)
+    test.assert_eq_str(mailhdr.format_date(mailhdr.datetime(dt, -360)), a1_1_date())
+
+@test
+fn test_minus_zero_zero_zero_zero_means_the_zone_is_unknown() [io]
+    // RFC 5322 § 3.3 gives -0000 a meaning of its own: the time was
+    // generated on a system in a zone it could not name.  Turning it
+    // into +0000 asserts UTC, which is not what was said.
+    test.case("-0000 parses with offset_known false")
+    match mailhdr.parse_date("Fri, 21 Nov 1997 09:55:06 -0000")
+        Ok(d)  =>
+            test.assert_eq(d.offset_minutes, 0)
+            test.assert_false(d.offset_known, "-0000 does not assert UTC")
+        Err(e) => test.fail(e.message())
+
+    test.case("and +0000 parses with offset_known true")
+    match mailhdr.parse_date("Fri, 21 Nov 1997 09:55:06 +0000")
+        Ok(d)  => test.assert(d.offset_known)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_an_obsolete_date_is_read_and_never_written() [io]
+    // RFC 5322 § 4.3 — the forms in the archives.
+    test.case("the alphabetic zone GMT is accepted on the way in")
+    match mailhdr.parse_date("21 Nov 97 09:55:06 GMT")
+        Ok(d)  => test.assert_eq(d.local.date.year, 1997)
+        Err(e) => test.fail(e.message())
+
+    test.case("and a field that is not a date-time at all is refused")
+    match mailhdr.parse_date("yesterday")
+        Ok(_)  => test.fail("`yesterday` is not a date-time")
+        Err(e) => test.assert(str.len(e.message()) > 0)
+
+@test
+fn test_a_message_id_is_two_halves_in_brackets() [io]
+    test.case("RFC 5322 A.1.1 — <1234@local.machine.example>")
+    match mailhdr.parse_message_id("<1234@local.machine.example>")
+        Ok(m)  =>
+            test.assert_eq_str(m.id_left, "1234")
+            test.assert_eq_str(m.id_right, "local.machine.example")
+        Err(e) => test.fail(e.message())
+
+    test.case("and it is written back with its brackets")
+    test.assert_eq_str(mailhdr.format_message_id(mailhdr.message_id("1234", "local.machine.example")),
+                       "<1234@local.machine.example>")
+
+    test.case("a References field is a sequence of them")
+    match mailhdr.parse_message_ids("<a@x> <b@x> <c@x>")
+        Ok(ms) => test.assert_eq(list.len(ms), 3)
+        Err(e) => test.fail(e.message())
+
+    test.case("and a field with no brackets is refused")
+    match mailhdr.parse_message_id("1234@local")
+        Ok(_)  => test.fail("a msg-id is bracketed")
+        Err(e) => test.assert(str.len(e.message()) > 0)
+
+@test
+fn test_an_address_field_is_read_through_the_headers() [io]
+    test.case("To: is parsed with the address grammar")
+    let h = mailhdr.headers([mailhdr.field("To", "Ada <ada@example.com>, alan@example.com")])
+    match mailhdr.addresses_of(h, "to")
+        Ok(es) => test.assert_eq(list.len(es), 2)
+        Err(e) => test.fail(e.message())
+
+    test.case("an absent field is an empty list, not a refusal")
+    match mailhdr.addresses_of(mailhdr.headers([]), "cc")
+        Ok(es) => test.assert_eq(list.len(es), 0)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_the_header_section_is_written_back_with_its_blank_line() [io]
+    test.case("format_headers ends the section")
+    let out = mailhdr.format_headers(mailhdr.headers([mailhdr.field("Subject", "Hi")]))
+    test.assert(str.ends_with(out, "\r\n\r\n"))

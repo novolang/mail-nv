@@ -1,0 +1,243 @@
+// mailxfer.nv — the content transfer encodings: how a body's octets
+// were armoured to survive a mail path, and how to take the armour
+// off.
+//
+// WHY A BODY IS ENCODED AT ALL
+//
+// RFC 2045 § 2.4 calls these mechanisms, and the reason they exist is
+// historical and still binding: a mail relay may only be trusted with
+// lines of at most 998 octets of US-ASCII.  Two encodings exist to get
+// arbitrary octets through that.
+//
+// `quoted-printable` (§ 6.7) leaves printable ASCII alone and writes
+// everything else as `=XX`.  It is for text that is MOSTLY ASCII: the
+// result is still readable in a raw message, which matters when
+// somebody is reading one.  Lines are kept under 76 octets by a SOFT
+// LINE BREAK, an `=` at the end of a line, which is removed on
+// decoding and is not part of the data.
+//
+// `base64` (§ 6.8) writes three octets as four characters.  It is for
+// binary: a third larger, unreadable, and it never has to decide
+// anything.
+//
+// THE RESULT IS BYTES, AND THE INPUT IS A SPAN
+//
+// Both decoders take the message's bytes and a span into them, and
+// answer `Bytes`.  The span is what keeps a 30 MB attachment from
+// being copied twice before anybody asks for it: the tree holds the
+// span, and a caller that wants the attachment calls `decode` and pays
+// for one copy at that moment.  A caller that only wanted the file
+// name pays for nothing.
+//
+// LINE ENDINGS ARE CANONICAL ON THE WIRE AND NOT IN THE DATA
+//
+// RFC 2045 § 6.7 is explicit: for `text/*` the data is converted to
+// canonical CRLF form BEFORE it is encoded, and back afterwards.  So a
+// decoder that returns CRLF has returned what was sent, and
+// `to_native_newlines` is the conversion a caller applies when it
+// wants text rather than wire octets.  Getting this backwards is how a
+// signed message stops verifying after a round trip.
+
+use mailctype
+use mailerror
+
+// A range of octets in a message's bytes: where a body part is,
+// without copying it.
+//
+// Valid only against the `Bytes` it was cut from.  A span kept past
+// those bytes is `MailSpanOutOfRange` at the next `decode`, not
+// silently wrong data.
+//
+// ```novo
+// use mailxfer
+//
+// fn main() [io]
+//     println("${mailxfer.span(10, 4).len}")            // 4
+// ```
+pub struct MailSpan
+    // The offset of the first octet.
+    start: Int
+    // How many octets.
+    len: Int
+
+// A span.
+//
+// ```novo
+// use mailxfer
+//
+// fn main() [io]
+//     println("${mailxfer.span(0, 0).start}")           // 0
+// ```
+pub fn span(start: Int, len: Int) -> MailSpan
+    todo("mail-nv.mailxfer.span")
+
+// The octets a span names, copied out of the source.
+//
+// `MailSpanOutOfRange` when the span reaches past the source, which is
+// what a caller that kept a span too long gets instead of a panic or a
+// short read.
+//
+// ```novo
+// use mailxfer
+//
+// fn main() [io]
+//     match mailxfer.slice(bytes.from_str("hello"), mailxfer.span(1, 3))
+//         Ok(b)  => println("${bytes.len(b)}")          // 3
+//         Err(e) => println(e.message())
+// ```
+pub fn slice(source: Bytes, s: MailSpan) -> Result<Bytes, mailerror.MailError>
+    todo("mail-nv.mailxfer.slice")
+
+// A span decoded according to a transfer encoding.
+//
+// The one function a caller needs: it chooses the decoder, so nothing
+// upstream has to `match` on the encoding.  `7bit`, `8bit` and
+// `binary` copy the span unchanged, which is what RFC 2045 § 6.2 says
+// they mean.
+//
+// ```novo
+// use mailxfer
+// use mailctype
+//
+// fn main() [io]
+//     let src = bytes.from_str("aGk=")
+//     match mailxfer.decode(src, mailxfer.span(0, 4), MailBase64Encoding)
+//         Ok(b)  => println("${bytes.len(b)}")          // 2
+//         Err(e) => println(e.message())
+// ```
+pub fn decode(source: Bytes, s: MailSpan,
+              encoding: mailctype.MailTransferEncoding) -> Result<Bytes, mailerror.MailError>
+    todo("mail-nv.mailxfer.decode")
+
+// Octets encoded according to a transfer encoding, with the line
+// length the mechanism requires.
+//
+// ```novo
+// use mailxfer
+// use mailctype
+//
+// fn main() [io]
+//     println(mailxfer.encode(bytes.from_str("hi"), MailBase64Encoding))
+// ```
+pub fn encode(data: Bytes, encoding: mailctype.MailTransferEncoding) -> Str
+    todo("mail-nv.mailxfer.encode")
+
+// A quoted-printable body decoded, RFC 2045 § 6.7.
+//
+// `MailBadQuotedPrintable` when an `=` is not followed by two
+// hexadecimal digits or by a line break.  A lowercase hexadecimal
+// digit is accepted on the way in, although § 6.7 rule 2 requires
+// uppercase on the way out, because senders emit both and refusing
+// would lose readable mail.
+//
+// ```novo
+// use mailxfer
+//
+// fn main() [io]
+//     let src = bytes.from_str("Caf=C3=A9")
+//     match mailxfer.decode_quoted_printable(src, mailxfer.span(0, 9))
+//         Ok(b)  => println("${bytes.len(b)}")          // 5
+//         Err(e) => println(e.message())
+// ```
+pub fn decode_quoted_printable(source: Bytes, s: MailSpan) -> Result<Bytes, mailerror.MailError>
+    todo("mail-nv.mailxfer.decode_quoted_printable")
+
+// Octets encoded as quoted-printable, with soft line breaks so that no
+// line exceeds 76 octets.
+//
+// A trailing space or tab at the end of a line is always encoded, as
+// § 6.7 rule 3 requires: trailing whitespace is what mail paths strip,
+// and a body whose last space was eaten is a body whose signature no
+// longer verifies.
+//
+// ```novo
+// use mailxfer
+//
+// fn main() [io]
+//     println(mailxfer.encode_quoted_printable(bytes.from_str("hi")))
+// ```
+pub fn encode_quoted_printable(data: Bytes) -> Str
+    todo("mail-nv.mailxfer.encode_quoted_printable")
+
+// A base64 body decoded, RFC 2045 § 6.8.
+//
+// Line breaks and whitespace inside the span are skipped, as § 6.8
+// requires.  `MailBadBase64` for an octet outside the alphabet or for
+// padding that is not at the end.
+//
+// ```novo
+// use mailxfer
+//
+// fn main() [io]
+//     match mailxfer.decode_base64(bytes.from_str("aGk="), mailxfer.span(0, 4))
+//         Ok(b)  => println("${bytes.len(b)}")          // 2
+//         Err(e) => println(e.message())
+// ```
+pub fn decode_base64(source: Bytes, s: MailSpan) -> Result<Bytes, mailerror.MailError>
+    todo("mail-nv.mailxfer.decode_base64")
+
+// Octets encoded as base64, wrapped at 76 characters per line.
+//
+// 76 and not 64: RFC 2045 § 6.8 sets the limit at 76, and a line that
+// is longer is a line some relay will fold in a place that breaks the
+// data.
+//
+// ```novo
+// use mailxfer
+//
+// fn main() [io]
+//     println(mailxfer.encode_base64(bytes.from_str("hi")))    // aGk=
+// ```
+pub fn encode_base64(data: Bytes) -> Str
+    todo("mail-nv.mailxfer.encode_base64")
+
+// The transfer encoding that would be chosen for these octets: `7bit`
+// when they are already ASCII with short lines, `quoted-printable`
+// when they are mostly ASCII, `base64` otherwise.
+//
+// A builder calls it so that a plain English message is not base64'd
+// into unreadability and a JPEG is not quoted-printable'd into three
+// times its size.
+//
+// ```novo
+// use mailxfer
+// use mailctype
+//
+// fn main() [io]
+//     println(mailctype.transfer_encoding_name(mailxfer.choose_encoding(bytes.from_str("hello"))))
+// ```
+pub fn choose_encoding(data: Bytes) -> mailctype.MailTransferEncoding
+    todo("mail-nv.mailxfer.choose_encoding")
+
+// Octets with every line ending converted to CRLF, the canonical form
+// RFC 2045 § 6.7 requires before a `text/*` body is encoded.
+//
+// A lone CR and a lone LF both become CRLF; a CRLF is left alone, so
+// the function is idempotent and a caller may apply it without knowing
+// what it has.
+//
+// ```novo
+// use mailxfer
+//
+// fn main() [io]
+//     println("${bytes.len(mailxfer.to_crlf(bytes.from_str("a\nb")))}")   // 4
+// ```
+pub fn to_crlf(data: Bytes) -> Bytes
+    todo("mail-nv.mailxfer.to_crlf")
+
+// Octets with every CRLF converted to a single LF, for a caller that
+// wants text rather than wire octets.
+//
+// The inverse of `to_crlf`, and the conversion that must NOT be
+// applied to a body whose signature is being checked: dkim-nv hashes
+// the canonical CRLF form, so a body converted first hashes to
+// something else.
+//
+// ```novo
+// use mailxfer
+//
+// fn main() [io]
+//     println("${bytes.len(mailxfer.to_lf(bytes.from_str("a\r\nb")))}")   // 3
+// ```
+pub fn to_lf(data: Bytes) -> Bytes
+    todo("mail-nv.mailxfer.to_lf")
