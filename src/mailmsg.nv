@@ -44,7 +44,183 @@ use mailctype
 use mailerror
 use mailhdr
 use mailmime
+use mailword
 use mailxfer
+
+// ── Private helpers ──────────────────────────────────────────────────
+
+// The text with a CRLF after it, unless it is empty or already ends a
+// line.
+fn terminated(text: Str) -> Str
+    if str.len(text) == 0
+        // cov: skip — every part a builder wraps carries its own header lines
+        return "\r\n"
+    if str.ends_with(text, "\n")
+        return text
+    "${text}\r\n"
+
+// A `text/*` type for these octets: bare when they are already
+// US-ASCII, `charset=utf-8` when they are not, so the type never
+// claims a set the body is not in.
+fn text_type(base: Str, content: Bytes) -> mailctype.MailContentType
+    if mailxfer.choose_encoding(content) == MailSevenBit
+        return mailctype.content_type("text", base, [])
+    mailctype.content_type("text", base, [mailctype.param("charset", "utf-8")])
+
+// A leaf part written: its own headers, the blank line, and the body
+// in the transfer encoding chosen for it.
+fn leaf_written(ct: mailctype.MailContentType, content: Bytes) -> Str
+    let enc = mailxfer.choose_encoding(content)
+    var fields: [mailhdr.MailField] = []
+    list.push(fields, mailhdr.field("Content-Type", mailctype.format_content_type(ct)))
+    list.push(fields, mailhdr.field("Content-Transfer-Encoding", mailctype.transfer_encoding_name(enc)))
+    "${mailhdr.format_headers(mailhdr.headers(fields))}${mailxfer.encode(content, enc)}"
+
+// A part whose body is already written — a multipart's delimiters, or
+// anything else that needs only its own type said above it.
+fn enclosed_written(ct: mailctype.MailContentType, body: Str) -> Str
+    "${mailhdr.format_headers(mailhdr.headers([mailhdr.field("Content-Type", mailctype.format_content_type(ct))]))}${body}"
+
+// An attachment written, with the disposition that offers it and the
+// identifier a `cid:` URL reaches it by.
+fn attachment_written(a: MailAttachment) -> Str
+    let enc = mailxfer.choose_encoding(a.content)
+    var params: [mailctype.MailParam] = []
+    if str.len(a.filename) > 0
+        // RFC 2231 § 3 when the name is not US-ASCII: a bare octet
+        // above 126 in a header is what a receiver is allowed to
+        // mangle, and a mangled filename is a file with no name.
+        if mailword.needs_encoding(a.filename)
+            for section in mailword.split_parameter("filename", a.filename, MailUtf8)
+                list.push(params, mailctype.param(section.0, section.1))
+        else
+            list.push(params, mailctype.param("filename", a.filename))
+    var kind = MailAttachmentDisposition
+    if a.inline
+        kind = MailInlineDisposition
+    var fields: [mailhdr.MailField] = []
+    list.push(fields, mailhdr.field("Content-Type", mailctype.format_content_type(a.content_type)))
+    list.push(fields, mailhdr.field("Content-Transfer-Encoding", mailctype.transfer_encoding_name(enc)))
+    list.push(fields, mailhdr.field("Content-Disposition",
+                                    mailctype.format_disposition(mailctype.disposition(kind, params))))
+    if str.len(a.content_id) > 0
+        list.push(fields, mailhdr.field("Content-ID", "<${a.content_id}>"))
+    "${mailhdr.format_headers(mailhdr.headers(fields))}${mailxfer.encode(a.content, enc)}"
+
+// Parts between the lines of one boundary.  The boundary is chosen
+// from the parts themselves, because RFC 2046 § 5.1.1 requires that it
+// occur in none of them and a constant would split somebody's message
+// in the wrong place.
+fn wrapped(subtype: Str, parts: [Str], seed: Int) -> (Str, mailctype.MailContentType)
+    let joined = str.join(parts, "")
+    let boundary = mailmime.fresh_boundary(bytes.from_str(joined), seed)
+    var out: [Str] = []
+    for part in parts
+        list.push(out, "--${boundary}\r\n")
+        list.push(out, terminated(part))
+    list.push(out, "--${boundary}--\r\n")
+    (str.join(out, ""),
+     mailctype.content_type("multipart", subtype, [mailctype.param("boundary", boundary)]))
+
+// The body of a draft, and the type that describes it.
+fn content_of(d: MailDraft, seed: Int) -> (Str, mailctype.MailContentType)
+    // RFC 2045 § 6.7: a text body is canonicalised to CRLF before it is
+    // encoded, so a body with a bare LF does not put one on the wire.
+    let text = mailxfer.to_crlf(bytes.from_str(d.text_body))
+    let html = mailxfer.to_crlf(bytes.from_str(d.html_body))
+    var body = ""
+    var ct = mailctype.content_type("text", "plain", [])
+    if bytes.len(text) > 0 and bytes.len(html) > 0
+        var arms: [Str] = []
+        list.push(arms, leaf_written(text_type("plain", text), text))
+        list.push(arms, leaf_written(text_type("html", html), html))
+        let made = wrapped("alternative", arms, seed)
+        body = made.0
+        ct = made.1
+    elif bytes.len(html) > 0
+        ct = text_type("html", html)
+        body = mailxfer.encode(html, mailxfer.choose_encoding(html))
+    else
+        ct = text_type("plain", text)
+        body = mailxfer.encode(text, mailxfer.choose_encoding(text))
+    var inlined: [Str] = []
+    var offered: [Str] = []
+    for a in d.attachments
+        if str.len(a.content_id) > 0
+            list.push(inlined, attachment_written(a))
+        else
+            list.push(offered, attachment_written(a))
+    if list.len(inlined) > 0
+        // RFC 2387: the document first, the resources it names after
+        // it, so an HTML part's `cid:` URLs resolve.
+        var related: [Str] = [enclosed_written(ct, body)]
+        for p in inlined
+            list.push(related, p)
+        let made = wrapped("related", related, seed + 1)
+        body = made.0
+        ct = made.1
+    if list.len(offered) > 0
+        var mixed: [Str] = [enclosed_written(ct, body)]
+        for p in offered
+            list.push(mixed, p)
+        let made = wrapped("mixed", mixed, seed + 2)
+        body = made.0
+        ct = made.1
+    (body, ct)
+
+// The two encodings a built message's author may be named in: a
+// `From:` field is a list of mailboxes, and a `Sender:` is one.
+fn mailbox_entries(from: [mailaddr.MailAddress]) -> [mailaddr.MailEntry]
+    var out: [mailaddr.MailEntry] = []
+    for a in from
+        list.push(out, MailMailbox(a))
+    out
+
+// A draft written as octets.  `with_bcc` decides whether the `Bcc:`
+// field is written, which is the whole difference between the copy for
+// the wire and the copy for the sender's folder.
+fn build_message(d: MailDraft, with_bcc: Bool) -> Result<Bytes, mailerror.MailError>
+    if list.len(d.from) == 0
+        return Err(MailBadAddress(0, "a message must name its author"))
+    if list.len(d.from) > 1 and d.sender == None
+        return Err(MailBadAddress(0, "more than one From mailbox needs a Sender"))
+    let made = content_of(d, 7)
+    var fields: [mailhdr.MailField] = []
+    list.push(fields, mailhdr.field("From", mailaddr.format_entries(mailbox_entries(d.from))))
+    if let Some(s) = d.sender
+        list.push(fields, mailhdr.field("Sender", mailaddr.format_address(s)))
+    if list.len(d.to) > 0
+        list.push(fields, mailhdr.field("To", mailaddr.format_entries(d.to)))
+    if list.len(d.cc) > 0
+        list.push(fields, mailhdr.field("Cc", mailaddr.format_entries(d.cc)))
+    if with_bcc and list.len(d.bcc) > 0
+        list.push(fields, mailhdr.field("Bcc", mailaddr.format_entries(d.bcc)))
+    if list.len(d.reply_to) > 0
+        list.push(fields, mailhdr.field("Reply-To", mailaddr.format_entries(d.reply_to)))
+    if str.len(d.subject) > 0
+        var subject = d.subject
+        if mailword.needs_encoding(subject)
+            subject = mailword.encode_text(subject, MailUtf8)
+        list.push(fields, mailhdr.field("Subject", subject))
+    if let Some(dt) = d.date
+        list.push(fields, mailhdr.field("Date", mailhdr.format_date(dt)))
+    if let Some(id) = d.message_id
+        list.push(fields, mailhdr.field("Message-ID", mailhdr.format_message_id(id)))
+    if list.len(d.in_reply_to) > 0
+        // RFC 5322 § 3.6.4: `In-Reply-To` names the parent, and
+        // `References` the whole chain, which is what keeps a thread
+        // intact across clients that read one or the other.
+        list.push(fields, mailhdr.field("In-Reply-To",
+            mailhdr.format_message_id(d.in_reply_to[list.len(d.in_reply_to) - 1])))
+        var refs: [Str] = []
+        for id in d.in_reply_to
+            list.push(refs, mailhdr.format_message_id(id))
+        list.push(fields, mailhdr.field("References", str.join(refs, " ")))
+    list.push(fields, mailhdr.field("MIME-Version", "1.0"))
+    list.push(fields, mailhdr.field("Content-Type", mailctype.format_content_type(made.1)))
+    for f in d.extra
+        list.push(fields, f)
+    Ok(bytes.from_str("${mailhdr.format_headers(mailhdr.headers(fields))}${made.0}"))
 
 // A parsed message: its octets, its headers, and its tree.
 //
@@ -157,7 +333,12 @@ pub struct MailAttachment
 //         Err(e) => println(e.message())
 // ```
 pub fn parse(source: Bytes, max_depth: Int) -> Result<MailMessage, mailerror.MailError>
-    todo("mail-nv.mailmsg.parse")
+    let section = mailhdr.parse_headers(source, 0)!
+    let root = mailmime.parse_part(source, section.headers,
+                                   mailxfer.span(section.body_offset,
+                                                 bytes.len(source) - section.body_offset),
+                                   max_depth)!
+    Ok(MailMessage { source: source, headers: section.headers, root: root })
 
 // The `Subject:` with its encoded words decoded, or `""`.
 //
@@ -173,7 +354,15 @@ pub fn parse(source: Bytes, max_depth: Int) -> Result<MailMessage, mailerror.Mai
 //         Err(e) => println(e.message())
 // ```
 pub fn subject_of(m: MailMessage) -> Str
-    todo("mail-nv.mailmsg.subject_of")
+    // RFC 2047 § 2: a subject that is not US-ASCII arrives in encoded
+    // words, and a caller wants the text rather than the encoding.  A
+    // set this package does not convert is the one case where the raw
+    // value is the better answer, because it is at least the octets
+    // that arrived.
+    let raw = mailhdr.value_of(m.headers, "subject")
+    match mailword.decode_text(raw)
+        Ok(text) => text
+        Err(_)   => raw
 
 // The `From:` mailboxes, with any group flattened.
 //
@@ -193,7 +382,8 @@ pub fn subject_of(m: MailMessage) -> Str
 //         Err(e) => println(e.message())
 // ```
 pub fn from_of(m: MailMessage) -> Result<[mailaddr.MailAddress], mailerror.MailError>
-    todo("mail-nv.mailmsg.from_of")
+    let entries = mailhdr.addresses_of(m.headers, "from")!
+    Ok(mailaddr.mailboxes_of(entries))
 
 // The `To:`, `Cc:` and `Bcc:` entries together, in that order.
 //
@@ -213,7 +403,12 @@ pub fn from_of(m: MailMessage) -> Result<[mailaddr.MailAddress], mailerror.MailE
 //         Err(e) => println(e.message())
 // ```
 pub fn recipients_of(m: MailMessage) -> Result<[mailaddr.MailEntry], mailerror.MailError>
-    todo("mail-nv.mailmsg.recipients_of")
+    var out: [mailaddr.MailEntry] = []
+    for name in ["to", "cc", "bcc"]
+        let entries = mailhdr.addresses_of(m.headers, name)!
+        for e in entries
+            list.push(out, e)
+    Ok(out)
 
 // The `Date:` parsed, or `None` when the field is absent.
 //
@@ -233,7 +428,11 @@ pub fn recipients_of(m: MailMessage) -> Result<[mailaddr.MailEntry], mailerror.M
 //         Err(e) => println(e.message())
 // ```
 pub fn date_of(m: MailMessage) -> Result<?mailhdr.MailDateTime, mailerror.MailError>
-    todo("mail-nv.mailmsg.date_of")
+    let raw = mailhdr.value_of(m.headers, "date")
+    if str.len(raw) == 0
+        return Ok(None)
+    let parsed = mailhdr.parse_date(raw)!
+    Ok(Some(parsed))
 
 // The `Message-ID:` parsed, or `None`.
 //
@@ -249,7 +448,11 @@ pub fn date_of(m: MailMessage) -> Result<?mailhdr.MailDateTime, mailerror.MailEr
 //         Err(e) => println(e.message())
 // ```
 pub fn message_id_of(m: MailMessage) -> Result<?mailhdr.MailMessageId, mailerror.MailError>
-    todo("mail-nv.mailmsg.message_id_of")
+    let raw = mailhdr.value_of(m.headers, "message-id")
+    if str.len(raw) == 0
+        return Ok(None)
+    let parsed = mailhdr.parse_message_id(raw)!
+    Ok(Some(parsed))
 
 // The identifiers of the messages this one replies to: `References:`
 // if present, otherwise `In-Reply-To:`.
@@ -270,7 +473,14 @@ pub fn message_id_of(m: MailMessage) -> Result<?mailhdr.MailMessageId, mailerror
 //         Err(e) => println(e.message())
 // ```
 pub fn thread_parents_of(m: MailMessage) -> Result<[mailhdr.MailMessageId], mailerror.MailError>
-    todo("mail-nv.mailmsg.thread_parents_of")
+    let refs = mailhdr.value_of(m.headers, "references")
+    if str.len(refs) > 0
+        return mailhdr.parse_message_ids(refs)
+    let parent = mailhdr.value_of(m.headers, "in-reply-to")
+    if str.len(parent) > 0
+        return mailhdr.parse_message_ids(parent)
+    var none: [mailhdr.MailMessageId] = []
+    Ok(none)
 
 // The message's plain text, from the part a reader would show, or
 // `""`.
@@ -287,7 +497,16 @@ pub fn thread_parents_of(m: MailMessage) -> Result<[mailhdr.MailMessageId], mail
 //         Err(e) => println(e.message())
 // ```
 pub fn text_of(m: MailMessage) -> Result<Str, mailerror.MailError>
-    todo("mail-nv.mailmsg.text_of")
+    // The part a reader would show, so a message with both arms of a
+    // `multipart/alternative` answers the one a reader sees rather than
+    // the plainest one that happens to come first.
+    for p in mailmime.display_parts(m.root)
+        if p.content_type.type_name == "text" and p.content_type.subtype == "plain"
+            return mailmime.decoded_text(m.source, p)
+    let anywhere = mailmime.text_part(m.root)
+    if let Some(p) = anywhere
+        return mailmime.decoded_text(m.source, p)
+    Ok("")
 
 // The octets of a part, decoded, taken from the message they belong
 // to.
@@ -308,7 +527,7 @@ pub fn text_of(m: MailMessage) -> Result<Str, mailerror.MailError>
 //         Err(e) => println(e.message())
 // ```
 pub fn part_bytes(m: MailMessage, p: mailmime.MailPart) -> Result<Bytes, mailerror.MailError>
-    todo("mail-nv.mailmsg.part_bytes")
+    mailmime.decoded_body(m.source, p)
 
 // An empty draft: no addresses, no subject, no body.
 //
@@ -319,7 +538,29 @@ pub fn part_bytes(m: MailMessage, p: mailmime.MailPart) -> Result<Bytes, mailerr
 //     println("${str.len(mailmsg.draft().subject)}")    // 0
 // ```
 pub fn draft() -> MailDraft
-    todo("mail-nv.mailmsg.draft")
+    var authors: [mailaddr.MailAddress] = []
+    var entries: [mailaddr.MailEntry] = []
+    var cc: [mailaddr.MailEntry] = []
+    var bcc: [mailaddr.MailEntry] = []
+    var reply_to: [mailaddr.MailEntry] = []
+    var parents: [mailhdr.MailMessageId] = []
+    var files: [MailAttachment] = []
+    var extra: [mailhdr.MailField] = []
+    MailDraft {
+        from: authors,
+        sender: None,
+        to: entries,
+        cc: cc,
+        bcc: bcc,
+        reply_to: reply_to,
+        subject: "",
+        date: None,
+        message_id: None,
+        in_reply_to: parents,
+        text_body: "",
+        html_body: "",
+        attachments: files,
+        extra: extra }
 
 // The draft with its `From:` set.
 //
@@ -332,7 +573,21 @@ pub fn draft() -> MailDraft
 //     println("${list.len(d.from)}")                    // 1
 // ```
 pub fn with_from(d: MailDraft, from: [mailaddr.MailAddress]) -> MailDraft
-    todo("mail-nv.mailmsg.with_from")
+    MailDraft {
+        from: from,
+        sender: d.sender,
+        to: d.to,
+        cc: d.cc,
+        bcc: d.bcc,
+        reply_to: d.reply_to,
+        subject: d.subject,
+        date: d.date,
+        message_id: d.message_id,
+        in_reply_to: d.in_reply_to,
+        text_body: d.text_body,
+        html_body: d.html_body,
+        attachments: d.attachments,
+        extra: d.extra }
 
 // The draft with its `To:` set.
 //
@@ -345,7 +600,21 @@ pub fn with_from(d: MailDraft, from: [mailaddr.MailAddress]) -> MailDraft
 //     println("${list.len(mailmsg.with_to(mailmsg.draft(), to).to)}")   // 1
 // ```
 pub fn with_to(d: MailDraft, to: [mailaddr.MailEntry]) -> MailDraft
-    todo("mail-nv.mailmsg.with_to")
+    MailDraft {
+        from: d.from,
+        sender: d.sender,
+        to: to,
+        cc: d.cc,
+        bcc: d.bcc,
+        reply_to: d.reply_to,
+        subject: d.subject,
+        date: d.date,
+        message_id: d.message_id,
+        in_reply_to: d.in_reply_to,
+        text_body: d.text_body,
+        html_body: d.html_body,
+        attachments: d.attachments,
+        extra: d.extra }
 
 // The draft with its `Cc:` set.
 //
@@ -356,7 +625,21 @@ pub fn with_to(d: MailDraft, to: [mailaddr.MailEntry]) -> MailDraft
 //     println("${list.len(mailmsg.with_cc(mailmsg.draft(), []).cc)}")   // 0
 // ```
 pub fn with_cc(d: MailDraft, cc: [mailaddr.MailEntry]) -> MailDraft
-    todo("mail-nv.mailmsg.with_cc")
+    MailDraft {
+        from: d.from,
+        sender: d.sender,
+        to: d.to,
+        cc: cc,
+        bcc: d.bcc,
+        reply_to: d.reply_to,
+        subject: d.subject,
+        date: d.date,
+        message_id: d.message_id,
+        in_reply_to: d.in_reply_to,
+        text_body: d.text_body,
+        html_body: d.html_body,
+        attachments: d.attachments,
+        extra: d.extra }
 
 // The draft with its `Bcc:` set.
 //
@@ -372,7 +655,21 @@ pub fn with_cc(d: MailDraft, cc: [mailaddr.MailEntry]) -> MailDraft
 //     println("${list.len(mailmsg.with_bcc(mailmsg.draft(), []).bcc)}") // 0
 // ```
 pub fn with_bcc(d: MailDraft, bcc: [mailaddr.MailEntry]) -> MailDraft
-    todo("mail-nv.mailmsg.with_bcc")
+    MailDraft {
+        from: d.from,
+        sender: d.sender,
+        to: d.to,
+        cc: d.cc,
+        bcc: bcc,
+        reply_to: d.reply_to,
+        subject: d.subject,
+        date: d.date,
+        message_id: d.message_id,
+        in_reply_to: d.in_reply_to,
+        text_body: d.text_body,
+        html_body: d.html_body,
+        attachments: d.attachments,
+        extra: d.extra }
 
 // The draft with its `Reply-To:` set.
 //
@@ -383,7 +680,21 @@ pub fn with_bcc(d: MailDraft, bcc: [mailaddr.MailEntry]) -> MailDraft
 //     println("${list.len(mailmsg.with_reply_to(mailmsg.draft(), []).reply_to)}")
 // ```
 pub fn with_reply_to(d: MailDraft, reply_to: [mailaddr.MailEntry]) -> MailDraft
-    todo("mail-nv.mailmsg.with_reply_to")
+    MailDraft {
+        from: d.from,
+        sender: d.sender,
+        to: d.to,
+        cc: d.cc,
+        bcc: d.bcc,
+        reply_to: reply_to,
+        subject: d.subject,
+        date: d.date,
+        message_id: d.message_id,
+        in_reply_to: d.in_reply_to,
+        text_body: d.text_body,
+        html_body: d.html_body,
+        attachments: d.attachments,
+        extra: d.extra }
 
 // The draft with its subject set, as decoded text.
 //
@@ -394,7 +705,21 @@ pub fn with_reply_to(d: MailDraft, reply_to: [mailaddr.MailEntry]) -> MailDraft
 //     println(mailmsg.with_subject(mailmsg.draft(), "Hello").subject)
 // ```
 pub fn with_subject(d: MailDraft, subject: Str) -> MailDraft
-    todo("mail-nv.mailmsg.with_subject")
+    MailDraft {
+        from: d.from,
+        sender: d.sender,
+        to: d.to,
+        cc: d.cc,
+        bcc: d.bcc,
+        reply_to: d.reply_to,
+        subject: subject,
+        date: d.date,
+        message_id: d.message_id,
+        in_reply_to: d.in_reply_to,
+        text_body: d.text_body,
+        html_body: d.html_body,
+        attachments: d.attachments,
+        extra: d.extra }
 
 // The draft with its `Date:` set.
 //
@@ -411,7 +736,21 @@ pub fn with_subject(d: MailDraft, subject: Str) -> MailDraft
 //     println("${d.date != None}")                      // true
 // ```
 pub fn with_date(d: MailDraft, date: mailhdr.MailDateTime) -> MailDraft
-    todo("mail-nv.mailmsg.with_date")
+    MailDraft {
+        from: d.from,
+        sender: d.sender,
+        to: d.to,
+        cc: d.cc,
+        bcc: d.bcc,
+        reply_to: d.reply_to,
+        subject: d.subject,
+        date: Some(date),
+        message_id: d.message_id,
+        in_reply_to: d.in_reply_to,
+        text_body: d.text_body,
+        html_body: d.html_body,
+        attachments: d.attachments,
+        extra: d.extra }
 
 // The draft with its `Message-ID:` set.
 //
@@ -427,7 +766,21 @@ pub fn with_date(d: MailDraft, date: mailhdr.MailDateTime) -> MailDraft
 //     println("${d.message_id != None}")                // true
 // ```
 pub fn with_message_id(d: MailDraft, id: mailhdr.MailMessageId) -> MailDraft
-    todo("mail-nv.mailmsg.with_message_id")
+    MailDraft {
+        from: d.from,
+        sender: d.sender,
+        to: d.to,
+        cc: d.cc,
+        bcc: d.bcc,
+        reply_to: d.reply_to,
+        subject: d.subject,
+        date: d.date,
+        message_id: Some(id),
+        in_reply_to: d.in_reply_to,
+        text_body: d.text_body,
+        html_body: d.html_body,
+        attachments: d.attachments,
+        extra: d.extra }
 
 // The draft marked as a reply to these identifiers.
 //
@@ -444,7 +797,21 @@ pub fn with_message_id(d: MailDraft, id: mailhdr.MailMessageId) -> MailDraft
 //     println("${list.len(d.in_reply_to)}")             // 1
 // ```
 pub fn in_reply_to(d: MailDraft, parents: [mailhdr.MailMessageId]) -> MailDraft
-    todo("mail-nv.mailmsg.in_reply_to")
+    MailDraft {
+        from: d.from,
+        sender: d.sender,
+        to: d.to,
+        cc: d.cc,
+        bcc: d.bcc,
+        reply_to: d.reply_to,
+        subject: d.subject,
+        date: d.date,
+        message_id: d.message_id,
+        in_reply_to: parents,
+        text_body: d.text_body,
+        html_body: d.html_body,
+        attachments: d.attachments,
+        extra: d.extra }
 
 // The draft with its plain text body set.
 //
@@ -455,7 +822,21 @@ pub fn in_reply_to(d: MailDraft, parents: [mailhdr.MailMessageId]) -> MailDraft
 //     println(mailmsg.with_text_body(mailmsg.draft(), "hello").text_body)
 // ```
 pub fn with_text_body(d: MailDraft, text: Str) -> MailDraft
-    todo("mail-nv.mailmsg.with_text_body")
+    MailDraft {
+        from: d.from,
+        sender: d.sender,
+        to: d.to,
+        cc: d.cc,
+        bcc: d.bcc,
+        reply_to: d.reply_to,
+        subject: d.subject,
+        date: d.date,
+        message_id: d.message_id,
+        in_reply_to: d.in_reply_to,
+        text_body: text,
+        html_body: d.html_body,
+        attachments: d.attachments,
+        extra: d.extra }
 
 // The draft with its HTML body set.
 //
@@ -470,7 +851,21 @@ pub fn with_text_body(d: MailDraft, text: Str) -> MailDraft
 //     println("${str.len(mailmsg.with_html_body(mailmsg.draft(), "<p>hi</p>").html_body)}")
 // ```
 pub fn with_html_body(d: MailDraft, html: Str) -> MailDraft
-    todo("mail-nv.mailmsg.with_html_body")
+    MailDraft {
+        from: d.from,
+        sender: d.sender,
+        to: d.to,
+        cc: d.cc,
+        bcc: d.bcc,
+        reply_to: d.reply_to,
+        subject: d.subject,
+        date: d.date,
+        message_id: d.message_id,
+        in_reply_to: d.in_reply_to,
+        text_body: d.text_body,
+        html_body: html,
+        attachments: d.attachments,
+        extra: d.extra }
 
 // An attachment.
 //
@@ -483,7 +878,12 @@ pub fn with_html_body(d: MailDraft, html: Str) -> MailDraft
 //     println(mailmsg.attachment("r.pdf", ct, bytes.from_str("%PDF")).filename)
 // ```
 pub fn attachment(filename: Str, ct: mailctype.MailContentType, content: Bytes) -> MailAttachment
-    todo("mail-nv.mailmsg.attachment")
+    MailAttachment {
+        filename: filename,
+        content_type: ct,
+        content: content,
+        content_id: "",
+        inline: false }
 
 // An attachment shown in place, with a `Content-ID` an HTML body can
 // refer to with a `cid:` URL.
@@ -498,7 +898,12 @@ pub fn attachment(filename: Str, ct: mailctype.MailContentType, content: Bytes) 
 // ```
 pub fn inline_attachment(content_id: Str, ct: mailctype.MailContentType,
                          content: Bytes) -> MailAttachment
-    todo("mail-nv.mailmsg.inline_attachment")
+    MailAttachment {
+        filename: "",
+        content_type: ct,
+        content: content,
+        content_id: content_id,
+        inline: true }
 
 // The draft with an attachment appended.
 //
@@ -511,7 +916,25 @@ pub fn inline_attachment(content_id: Str, ct: mailctype.MailContentType,
 //     println("${list.len(mailmsg.with_attachment(mailmsg.draft(), a).attachments)}")
 // ```
 pub fn with_attachment(d: MailDraft, a: MailAttachment) -> MailDraft
-    todo("mail-nv.mailmsg.with_attachment")
+    var out: [MailAttachment] = []
+    for e in d.attachments
+        list.push(out, e)
+    list.push(out, a)
+    MailDraft {
+        from: d.from,
+        sender: d.sender,
+        to: d.to,
+        cc: d.cc,
+        bcc: d.bcc,
+        reply_to: d.reply_to,
+        subject: d.subject,
+        date: d.date,
+        message_id: d.message_id,
+        in_reply_to: d.in_reply_to,
+        text_body: d.text_body,
+        html_body: d.html_body,
+        attachments: out,
+        extra: d.extra }
 
 // The draft with an extra header field appended.
 //
@@ -528,7 +951,25 @@ pub fn with_attachment(d: MailDraft, a: MailAttachment) -> MailDraft
 //     println("${list.len(d.extra)}")                   // 1
 // ```
 pub fn with_header(d: MailDraft, f: mailhdr.MailField) -> MailDraft
-    todo("mail-nv.mailmsg.with_header")
+    var out: [mailhdr.MailField] = []
+    for e in d.extra
+        list.push(out, e)
+    list.push(out, f)
+    MailDraft {
+        from: d.from,
+        sender: d.sender,
+        to: d.to,
+        cc: d.cc,
+        bcc: d.bcc,
+        reply_to: d.reply_to,
+        subject: d.subject,
+        date: d.date,
+        message_id: d.message_id,
+        in_reply_to: d.in_reply_to,
+        text_body: d.text_body,
+        html_body: d.html_body,
+        attachments: d.attachments,
+        extra: out }
 
 // The draft written as message octets, for the wire.
 //
@@ -550,7 +991,7 @@ pub fn with_header(d: MailDraft, f: mailhdr.MailField) -> MailDraft
 //         Err(e) => println(e.message())
 // ```
 pub fn build(d: MailDraft) -> Result<Bytes, mailerror.MailError>
-    todo("mail-nv.mailmsg.build")
+    build_message(d, false)
 
 // The draft written as message octets WITH the `Bcc:` field, for the
 // copy a sender files in its own sent folder.
@@ -569,7 +1010,7 @@ pub fn build(d: MailDraft) -> Result<Bytes, mailerror.MailError>
 //         Err(e) => println(e.message())
 // ```
 pub fn build_with_bcc(d: MailDraft) -> Result<Bytes, mailerror.MailError>
-    todo("mail-nv.mailmsg.build_with_bcc")
+    build_message(d, true)
 
 // The header section of a parsed message, written back exactly as it
 // arrived, octet for octet.
@@ -588,7 +1029,7 @@ pub fn build_with_bcc(d: MailDraft) -> Result<Bytes, mailerror.MailError>
 //         Err(e) => println(e.message())
 // ```
 pub fn raw_header_span(m: MailMessage) -> mailxfer.MailSpan
-    todo("mail-nv.mailmsg.raw_header_span")
+    mailxfer.span(0, m.root.body.start)
 
 // The span of a parsed message's body: everything after the blank line
 // that ends the header section.
@@ -604,4 +1045,5 @@ pub fn raw_header_span(m: MailMessage) -> mailxfer.MailSpan
 //         Err(e) => println(e.message())
 // ```
 pub fn raw_body_span(m: MailMessage) -> mailxfer.MailSpan
-    todo("mail-nv.mailmsg.raw_body_span")
+    let start = m.root.body.start
+    mailxfer.span(start, bytes.len(m.source) - start)

@@ -92,10 +92,44 @@ pub enum MailError
 // exist at all (SPEC § 3.4).
 impl Error for MailError
     // The one-line message, for a log: what happened and where.
-    //
-    // Panics with `not implemented` until the bodies land.
     fn message(self) -> Str
-        todo("mail-nv.MailError.message")
+        match self
+            MailHeaderMalformed(offset)             =>
+                "malformed header line at offset ${offset}"
+            MailBadFieldName(offset)                =>
+                "field name has an octet outside the printable US-ASCII range at offset ${offset}"
+            MailHeadersUnterminated(offset)         =>
+                "header section is not terminated: no blank line at or before offset ${offset}"
+            MailBadAddress(offset, why)             =>
+                "bad address at offset ${offset}: ${why}"
+            MailBadDate(offset)                     =>
+                "bad date-time at offset ${offset}"
+            MailBadMessageId(offset)                =>
+                "bad message identifier at offset ${offset}"
+            MailBadContentType(offset, why)         =>
+                "bad content type at offset ${offset}: ${why}"
+            MailMissingBoundary(offset)             =>
+                "multipart with no boundary parameter at offset ${offset}"
+            MailBoundaryUnterminated(offset)        =>
+                "multipart closing boundary never arrived; the last one was at offset ${offset}"
+            MailUnknownTransferEncoding(name)       =>
+                "transfer encoding this package does not decode: ${name}"
+            MailBadQuotedPrintable(offset)          =>
+                "bad quoted-printable octet at offset ${offset}"
+            MailBadBase64(offset)                   =>
+                "bad base64 octet at offset ${offset}"
+            MailBadEncodedWord(offset)              =>
+                "bad encoded word at offset ${offset}"
+            MailUnknownCharset(name)                =>
+                "character set this package does not convert: ${name}"
+            MailBadParameterContinuation(name, why) =>
+                "bad parameter continuation for ${name}: ${why}"
+            MailLineTooLong(offset)                 =>
+                "line longer than the 998 octets RFC 5322 allows, at offset ${offset}"
+            MailTooDeep(depth)                      =>
+                "a part nests deeper than the limit of ${depth}"
+            MailSpanOutOfRange(offset, len)         =>
+                "span at offset ${offset} of ${len} octets reaches past its source"
 
 // The octet offset a refusal names, or `-1` for the arms that name a
 // string instead of a position.
@@ -110,7 +144,25 @@ impl Error for MailError
 //     println("${mailerror.offset_of(MailBadBase64(4096))}")   // 4096
 // ```
 pub fn offset_of(e: MailError) -> Int
-    todo("mail-nv.mailerror.offset_of")
+    match e
+        MailHeaderMalformed(offset)        => offset
+        MailBadFieldName(offset)           => offset
+        MailHeadersUnterminated(offset)    => offset
+        MailBadAddress(offset, _)          => offset
+        MailBadDate(offset)                => offset
+        MailBadMessageId(offset)           => offset
+        MailBadContentType(offset, _)      => offset
+        MailMissingBoundary(offset)        => offset
+        MailBoundaryUnterminated(offset)   => offset
+        MailBadQuotedPrintable(offset)     => offset
+        MailBadBase64(offset)              => offset
+        MailBadEncodedWord(offset)         => offset
+        MailLineTooLong(offset)            => offset
+        MailSpanOutOfRange(offset, _)      => offset
+        MailUnknownTransferEncoding(_)     => -1
+        MailUnknownCharset(_)              => -1
+        MailBadParameterContinuation(_, _) => -1
+        MailTooDeep(_)                     => -1
 
 // A short stable identifier for a refusal, for a metric label or a log
 // field: `"header-malformed"`, `"bad-base64"`, `"unknown-charset"`.
@@ -124,7 +176,25 @@ pub fn offset_of(e: MailError) -> Int
 //     println(mailerror.code(MailBadDate(31)))        // bad-date
 // ```
 pub fn code(e: MailError) -> Str
-    todo("mail-nv.mailerror.code")
+    match e
+        MailHeaderMalformed(_)             => "header-malformed"
+        MailBadFieldName(_)                => "bad-field-name"
+        MailHeadersUnterminated(_)         => "headers-unterminated"
+        MailBadAddress(_, _)               => "bad-address"
+        MailBadDate(_)                     => "bad-date"
+        MailBadMessageId(_)                => "bad-message-id"
+        MailBadContentType(_, _)           => "bad-content-type"
+        MailMissingBoundary(_)             => "missing-boundary"
+        MailBoundaryUnterminated(_)        => "boundary-unterminated"
+        MailUnknownTransferEncoding(_)     => "unknown-transfer-encoding"
+        MailBadQuotedPrintable(_)          => "bad-quoted-printable"
+        MailBadBase64(_)                   => "bad-base64"
+        MailBadEncodedWord(_)              => "bad-encoded-word"
+        MailUnknownCharset(_)              => "unknown-charset"
+        MailBadParameterContinuation(_, _) => "bad-parameter-continuation"
+        MailLineTooLong(_)                 => "line-too-long"
+        MailTooDeep(_)                     => "too-deep"
+        MailSpanOutOfRange(_, _)           => "span-out-of-range"
 
 // Whether the message arrived intact and this package simply cannot
 // render it.
@@ -141,7 +211,10 @@ pub fn code(e: MailError) -> Str
 //     println("${mailerror.is_unrenderable(MailUnknownCharset("x-mac-ce"))}")   // true
 // ```
 pub fn is_unrenderable(e: MailError) -> Bool
-    todo("mail-nv.mailerror.is_unrenderable")
+    match e
+        MailUnknownCharset(_)          => true
+        MailUnknownTransferEncoding(_) => true
+        _                              => false
 
 // Whether a refusal means the transfer was cut short rather than
 // written wrongly.
@@ -157,4 +230,7 @@ pub fn is_unrenderable(e: MailError) -> Bool
 //     println("${mailerror.is_truncated(MailBoundaryUnterminated(900))}")   // true
 // ```
 pub fn is_truncated(e: MailError) -> Bool
-    todo("mail-nv.mailerror.is_truncated")
+    match e
+        MailHeadersUnterminated(_)  => true
+        MailBoundaryUnterminated(_) => true
+        _                           => false

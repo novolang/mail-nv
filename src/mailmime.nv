@@ -42,7 +42,252 @@
 use mailctype
 use mailerror
 use mailhdr
+use mailword
 use mailxfer
+
+// ── Private helpers ──────────────────────────────────────────────────
+
+// Whether an octet is the whitespace RFC 2046 § 5.1.1 allows after a
+// delimiter.
+fn ws_byte(b: Int) -> Bool
+    b == ' ' or b == '\t'
+
+// ISO-8859-1 octets as UTF-8 text.  Every octet is a code point, which
+// is the whole definition of ISO-8859-1 and the reason it needs no
+// table.
+fn latin1_to_utf8(data: Bytes) -> Str
+    var out: [Int] = []
+    let n = bytes.len(data)
+    var i = 0
+    while i < n
+        let b = bytes.byte_at(data, i) ?? 0
+        if b < 128
+            list.push(out, b)
+        else
+            list.push(out, 192 + b / 64)
+            list.push(out, 128 + b % 64)
+        i = i + 1
+    bytes.byte_list_to_str(out)
+
+// Octets in a named character set, as text.  The three sets RFC 2045
+// § 5.2 makes mandatory are the three mailword converts, and the
+// refusal names any other rather than guessing at its octets.
+fn text_in(charset: Str, data: Bytes) -> Result<Str, mailerror.MailError>
+    match mailword.charset_named(charset)
+        Some(MailLatin1) => Ok(latin1_to_utf8(data))
+        Some(_)          => Ok(bytes.to_str(data))
+        None             => Err(MailUnknownCharset(charset))
+
+// The octets a span names as text, or `""` when the span is not in
+// these bytes.  A builder writes a preamble it never had as no octets
+// at all, and an empty span and a `MailSpanOutOfRange` are the same
+// nothing at that call site.
+fn span_text(source: Bytes, s: mailxfer.MailSpan) -> Str
+    match mailxfer.slice(source, s)
+        Ok(b)  => bytes.to_str(b)
+        Err(_) => ""
+
+// The text with a CRLF after it, unless it is empty or already ends a
+// line.  What puts a delimiter at the start of a line.
+fn line_complete(text: Str) -> Str
+    if str.len(text) == 0
+        return text
+    if str.ends_with(text, "\n")
+        return text
+    "${text}\r\n"
+
+// What the line at `i` is: 0 for an ordinary line, 1 for a part
+// delimiter, 2 for the closing delimiter.  `marker` is `--` and the
+// boundary.  A delimiter may carry trailing whitespace, which RFC 2046
+// § 5.1.1 calls transport padding.
+fn boundary_kind(source: Bytes, i: Int, to: Int, marker: Str) -> Int
+    let mlen = str.len(marker)
+    if i + mlen > to
+        return 0
+    var k = 0
+    while k < mlen
+        if (bytes.byte_at(source, i + k) ?? 0) != str.byte_at_or(marker, k, 0)
+            return 0
+        k = k + 1
+    var j = i + mlen
+    var closing = false
+    if j + 1 < to and (bytes.byte_at(source, j) ?? 0) == '-' and (bytes.byte_at(source, j + 1) ?? 0) == '-'
+        closing = true
+        j = j + 2
+    while j < to and ws_byte(bytes.byte_at(source, j) ?? 0)
+        j = j + 1
+    if j < to and not ((bytes.byte_at(source, j) ?? 0) == '\r' or (bytes.byte_at(source, j) ?? 0) == '\n')
+        return 0
+    if closing
+        return 2
+    1
+
+// Every delimiter line in `[from, to)`, with its offset and whether it
+// closes the multipart.
+fn delimiters(source: Bytes, from: Int, to: Int, boundary: Str) -> [(Int, Bool)]
+    let marker = "--${boundary}"
+    var out: [(Int, Bool)] = []
+    var at = from
+    while at < to
+        let kind = boundary_kind(source, at, to, marker)
+        if kind > 0
+            list.push(out, (at, kind == 2))
+        at = mailhdr.skip_break(source, mailhdr.line_end(source, at))
+    out
+
+// An offset from `from` to just before the line break at `stop`.
+fn before_break(source: Bytes, from: Int, stop: Int) -> Int
+    var e = stop
+    if e > from and (bytes.byte_at(source, e - 1) ?? 0) == '\n'
+        e = e - 1
+        if e > from and (bytes.byte_at(source, e - 1) ?? 0) == '\r'
+            e = e - 1
+    e
+
+// Whether a part is one a reader can show rather than carry.
+fn understood(p: MailPart) -> Bool
+    if mailctype.is_multipart(p.content_type)
+        return true
+    if mailctype.is_message(p.content_type)
+        return true
+    p.content_type.type_name == "text"
+
+// Whether a part is one a caller would offer as a file: its
+// disposition says so, or it is named and is not the body text.
+fn carried(p: MailPart) -> Bool
+    if let Some(d) = p.disposition
+        if mailctype.disposition_is_attachment(d)
+            return true
+    if mailctype.is_multipart(p.content_type) or mailctype.is_message(p.content_type)
+        return false
+    if p.content_type.type_name == "text"
+        return false
+    str.len(mailctype.param_value(p.content_type, "name")) > 0
+
+// The headers that describe a part: its own fields when it has them,
+// and an absent `Content-Type` read as `text/plain; charset=us-ascii`.
+fn part_type(h: mailhdr.MailHeaders) -> Result<mailctype.MailContentType, mailerror.MailError>
+    let written = mailhdr.value_of(h, "content-type")
+    if str.len(written) == 0
+        return Ok(mailctype.default_content_type())
+    mailctype.parse_content_type(written)
+
+// The transfer encoding a part's headers name, `7bit` when they name
+// none.
+fn part_encoding(h: mailhdr.MailHeaders) -> Result<mailctype.MailTransferEncoding, mailerror.MailError>
+    let written = mailhdr.value_of(h, "content-transfer-encoding")
+    if str.len(written) == 0
+        return Ok(MailSevenBit)
+    mailctype.parse_transfer_encoding(written)
+
+// The `Content-ID` without its angle brackets, which is what a `cid:`
+// URL carries (RFC 2392 § 2).
+fn part_content_id(h: mailhdr.MailHeaders) -> Str
+    var id = str.trim(mailhdr.value_of(h, "content-id"))
+    if str.starts_with(id, "<") and str.ends_with(id, ">") and str.len(id) > 1
+        id = str.slice(id, 1, str.len(id) - 1)
+    id
+
+// The part at `depth`, which is where the nesting limit is enforced.
+fn parse_at(source: Bytes, headers: mailhdr.MailHeaders, body: mailxfer.MailSpan, max_depth: Int,
+            depth: Int) -> Result<MailPart, mailerror.MailError>
+    let ct = part_type(headers)!
+    let enc = part_encoding(headers)!
+    let written_disp = mailhdr.value_of(headers, "content-disposition")
+    var disp: ?mailctype.MailDisposition = None
+    if str.len(written_disp) > 0
+        let d = mailctype.parse_disposition(written_disp)!
+        disp = Some(d)
+    if mailctype.is_multipart(ct)
+        return parse_multipart(source, headers, ct, enc, disp, body, max_depth, depth)
+    if mailctype.is_message(ct)
+        if max_depth <= 0
+            return Err(MailTooDeep(depth))
+        let inner = mailhdr.parse_headers(source, body.start)!
+        let end = body.start + body.len
+        let child = parse_at(source, inner.headers,
+                             mailxfer.span(inner.body_offset, end - inner.body_offset),
+                             max_depth - 1, depth + 1)!
+        var kids: [MailPart] = [child]
+        return Ok(MailPart {
+            headers: headers,
+            content_type: ct,
+            disposition: disp,
+            encoding: enc,
+            content_id: part_content_id(headers),
+            body: mailxfer.span(body.start, 0),
+            children: kids,
+            preamble: mailxfer.span(body.start, 0),
+            epilogue: mailxfer.span(body.start, 0),
+            depth: depth })
+    Ok(MailPart {
+        headers: headers,
+        content_type: ct,
+        disposition: disp,
+        encoding: enc,
+        content_id: part_content_id(headers),
+        body: body,
+        children: [],
+        preamble: mailxfer.span(body.start, 0),
+        epilogue: mailxfer.span(body.start, 0),
+        depth: depth })
+
+// The children of a `multipart/*` part, cut at its boundary lines.
+fn parse_multipart(source: Bytes, headers: mailhdr.MailHeaders, ct: mailctype.MailContentType,
+                   enc: mailctype.MailTransferEncoding, disp: ?mailctype.MailDisposition,
+                   body: mailxfer.MailSpan, max_depth: Int,
+                   depth: Int) -> Result<MailPart, mailerror.MailError>
+    let boundary = mailctype.boundary_of(ct)
+    if str.len(boundary) == 0
+        return Err(MailMissingBoundary(body.start))
+    if max_depth <= 0
+        return Err(MailTooDeep(depth))
+    let end = body.start + body.len
+    let marks = delimiters(source, body.start, end, boundary)
+    if list.len(marks) == 0
+        return Err(MailBoundaryUnterminated(body.start))
+    var children: [MailPart] = []
+    var preamble = mailxfer.span(body.start, 0)
+    var epilogue = mailxfer.span(end, 0)
+    var closed = false
+    var i = 0
+    while i < list.len(marks)
+        let m = marks[i]
+        let after = mailhdr.skip_break(source, mailhdr.line_end(source, m.0))
+        if i == 0
+            preamble = mailxfer.span(body.start, m.0 - body.start)
+        if m.1
+            closed = true
+            if after <= end
+                epilogue = mailxfer.span(after, end - after)
+            i = list.len(marks)
+        else
+            var stop = end
+            if i + 1 < list.len(marks)
+                let nxt = marks[i + 1]
+                stop = nxt.0
+            let inner = mailhdr.parse_headers(source, after)!
+            let content_end = before_break(source, after, stop)
+            if inner.body_offset > content_end
+                return Err(MailHeaderMalformed(after))
+            let child = parse_at(source, inner.headers,
+                                 mailxfer.span(inner.body_offset, content_end - inner.body_offset),
+                                 max_depth - 1, depth + 1)!
+            list.push(children, child)
+            i = i + 1
+    if not closed
+        return Err(MailBoundaryUnterminated(body.start))
+    Ok(MailPart {
+        headers: headers,
+        content_type: ct,
+        disposition: disp,
+        encoding: enc,
+        content_id: part_content_id(headers),
+        body: mailxfer.span(body.start, 0),
+        children: children,
+        preamble: preamble,
+        epilogue: epilogue,
+        depth: depth })
 
 // One node of the tree: a part's headers, its decoded type, and its
 // body.
@@ -110,7 +355,18 @@ pub enum MailWalkOrder
 //     println("${p.body.len}")                          // 5
 // ```
 pub fn leaf_part(ct: mailctype.MailContentType, body: mailxfer.MailSpan) -> MailPart
-    todo("mail-nv.mailmime.leaf_part")
+    var none: [MailPart] = []
+    MailPart {
+        headers: mailhdr.headers([]),
+        content_type: ct,
+        disposition: None,
+        encoding: MailSevenBit,
+        content_id: "",
+        body: body,
+        children: none,
+        preamble: mailxfer.span(body.start, 0),
+        epilogue: mailxfer.span(body.start, 0),
+        depth: 0 }
 
 // A multipart part from a type and its children.
 //
@@ -127,7 +383,17 @@ pub fn leaf_part(ct: mailctype.MailContentType, body: mailxfer.MailSpan) -> Mail
 //     println("${list.len(mailmime.multipart_part(ct, []).children)}")   // 0
 // ```
 pub fn multipart_part(ct: mailctype.MailContentType, children: [MailPart]) -> MailPart
-    todo("mail-nv.mailmime.multipart_part")
+    MailPart {
+        headers: mailhdr.headers([]),
+        content_type: ct,
+        disposition: None,
+        encoding: MailSevenBit,
+        content_id: "",
+        body: mailxfer.span(0, 0),
+        children: children,
+        preamble: mailxfer.span(0, 0),
+        epilogue: mailxfer.span(0, 0),
+        depth: 0 }
 
 // The tree parsed from a part's headers and the span its body
 // occupies.
@@ -150,7 +416,7 @@ pub fn multipart_part(ct: mailctype.MailContentType, children: [MailPart]) -> Ma
 // ```
 pub fn parse_part(source: Bytes, headers: mailhdr.MailHeaders, body: mailxfer.MailSpan,
                   max_depth: Int) -> Result<MailPart, mailerror.MailError>
-    todo("mail-nv.mailmime.parse_part")
+    parse_at(source, headers, body, max_depth, 0)
 
 // The part's body decoded: the span sliced out of the source and the
 // transfer encoding removed.
@@ -171,7 +437,7 @@ pub fn parse_part(source: Bytes, headers: mailhdr.MailHeaders, body: mailxfer.Ma
 //         Err(e) => println(e.message())
 // ```
 pub fn decoded_body(source: Bytes, p: MailPart) -> Result<Bytes, mailerror.MailError>
-    todo("mail-nv.mailmime.decoded_body")
+    mailxfer.decode(source, p.body, p.encoding)
 
 // The part's body decoded and converted to text using the character
 // set its `Content-Type` names.
@@ -191,7 +457,8 @@ pub fn decoded_body(source: Bytes, p: MailPart) -> Result<Bytes, mailerror.MailE
 //         Err(e) => println(e.message())
 // ```
 pub fn decoded_text(source: Bytes, p: MailPart) -> Result<Str, mailerror.MailError>
-    todo("mail-nv.mailmime.decoded_text")
+    let data = mailxfer.decode(source, p.body, p.encoding)!
+    text_in(mailctype.charset_of(p.content_type), data)
 
 // Every part of the tree in one flat list, parents before children.
 //
@@ -204,7 +471,11 @@ pub fn decoded_text(source: Bytes, p: MailPart) -> Result<Str, mailerror.MailErr
 //     println("${list.len(mailmime.walk_order(p))}")    // 1
 // ```
 pub fn walk_order(p: MailPart) -> [MailPart]
-    todo("mail-nv.mailmime.walk_order")
+    var out: [MailPart] = [p]
+    for c in p.children
+        for e in walk_order(c)
+            list.push(out, e)
+    out
 
 // The parts a reader would display, in the order it would show them.
 //
@@ -222,7 +493,25 @@ pub fn walk_order(p: MailPart) -> [MailPart]
 //     println("${list.len(mailmime.display_parts(p))}") // 1
 // ```
 pub fn display_parts(p: MailPart) -> [MailPart]
-    todo("mail-nv.mailmime.display_parts")
+    if not (mailctype.is_multipart(p.content_type) or mailctype.is_message(p.content_type))
+        var alone: [MailPart] = [p]
+        return alone
+    if p.content_type.subtype == "alternative"
+        var chosen: ?MailPart = None
+        for c in p.children
+            if understood(c)
+                chosen = Some(c)
+        if list.len(p.children) > 0 and chosen == None
+            chosen = Some(p.children[list.len(p.children) - 1])
+        match chosen
+            Some(c) =>
+                return display_parts(c)
+            None    => ()
+    var out: [MailPart] = []
+    for c in p.children
+        for e in display_parts(c)
+            list.push(out, e)
+    out
 
 // The first `text/plain` part a reader would show, or `None`.
 //
@@ -237,7 +526,10 @@ pub fn display_parts(p: MailPart) -> [MailPart]
 //         None    => println("none")
 // ```
 pub fn text_part(p: MailPart) -> ?MailPart
-    todo("mail-nv.mailmime.text_part")
+    for e in walk_order(p)
+        if e.content_type.type_name == "text" and e.content_type.subtype == "plain"
+            return Some(e)
+    None
 
 // The first `text/html` part a reader would show, or `None`.
 //
@@ -252,7 +544,10 @@ pub fn text_part(p: MailPart) -> ?MailPart
 //         None    => println("none")
 // ```
 pub fn html_part(p: MailPart) -> ?MailPart
-    todo("mail-nv.mailmime.html_part")
+    for e in walk_order(p)
+        if e.content_type.type_name == "text" and e.content_type.subtype == "html"
+            return Some(e)
+    None
 
 // Every part a caller would offer as a file.
 //
@@ -270,7 +565,11 @@ pub fn html_part(p: MailPart) -> ?MailPart
 //     println("${list.len(mailmime.attachments_of(p))}")    // 0
 // ```
 pub fn attachments_of(p: MailPart) -> [MailPart]
-    todo("mail-nv.mailmime.attachments_of")
+    var out: [MailPart] = []
+    for e in walk_order(p)
+        if carried(e)
+            list.push(out, e)
+    out
 
 // The part a `cid:` reference names, or `None`.
 //
@@ -288,7 +587,12 @@ pub fn attachments_of(p: MailPart) -> [MailPart]
 //         None    => println("no such part")
 // ```
 pub fn part_by_content_id(p: MailPart, content_id: Str) -> ?MailPart
-    todo("mail-nv.mailmime.part_by_content_id")
+    if str.len(content_id) == 0
+        return None
+    for e in walk_order(p)
+        if e.content_id == content_id
+            return Some(e)
+    None
 
 // The file name a part should be saved under, or `""`.
 //
@@ -307,7 +611,11 @@ pub fn part_by_content_id(p: MailPart, content_id: Str) -> ?MailPart
 //     println("[${mailmime.filename_of(p)}]")           // []
 // ```
 pub fn filename_of(p: MailPart) -> Str
-    todo("mail-nv.mailmime.filename_of")
+    if let Some(d) = p.disposition
+        let named = mailctype.filename_of(d)
+        if str.len(named) > 0
+            return named
+    mailctype.param_value(p.content_type, "name")
 
 // A boundary string that does not occur in these octets.
 //
@@ -324,7 +632,16 @@ pub fn filename_of(p: MailPart) -> Str
 //     println("${str.len(mailmime.fresh_boundary(bytes.from_str("body"), 7))}")
 // ```
 pub fn fresh_boundary(content: Bytes, seed: Int) -> Str
-    todo("mail-nv.mailmime.fresh_boundary")
+    let text = bytes.to_str(content)
+    var n = 0
+    // Only `bchars` from RFC 2046 § 5.1.1's set, no tspecials among
+    // them, so the boundary is written as an ordinary parameter rather
+    // than being quoted or split into RFC 2231 sections.
+    var candidate = "novo-mail-${seed}"
+    while str.contains(text, candidate) and n < 64
+        n = n + 1
+        candidate = "novo-mail-${seed}-${n}"
+    candidate
 
 // The part written back as message octets: its headers, a blank line,
 // and its body encoded, with children separated by the boundary its
@@ -346,4 +663,30 @@ pub fn fresh_boundary(content: Bytes, seed: Int) -> Str
 //         Err(e) => println(e.message())
 // ```
 pub fn format_part(source: Bytes, p: MailPart) -> Result<Str, mailerror.MailError>
-    todo("mail-nv.mailmime.format_part")
+    if mailctype.is_multipart(p.content_type)
+        return format_multipart(source, p)
+    if mailctype.is_message(p.content_type)
+        var kids: [Str] = []
+        for c in p.children
+            let one = format_part(source, c)!
+            list.push(kids, one)
+        return Ok("${mailhdr.format_headers(p.headers)}${str.join(kids, "")}")
+    let data = mailxfer.slice(source, p.body)!
+    Ok("${mailhdr.format_headers(p.headers)}${mailxfer.encode(data, p.encoding)}")
+
+// A multipart written back: each child between two boundary lines, the
+// preamble before the first and the epilogue after the last.
+fn format_multipart(source: Bytes, p: MailPart) -> Result<Str, mailerror.MailError>
+    let boundary = mailctype.boundary_of(p.content_type)
+    if str.len(boundary) == 0
+        return Err(MailMissingBoundary(p.body.start))
+    var out: [Str] = []
+    list.push(out, mailhdr.format_headers(p.headers))
+    list.push(out, line_complete(span_text(source, p.preamble)))
+    for c in p.children
+        list.push(out, "--${boundary}\r\n")
+        let one = format_part(source, c)!
+        list.push(out, line_complete(one))
+    list.push(out, "--${boundary}--\r\n")
+    list.push(out, line_complete(span_text(source, p.epilogue)))
+    Ok(str.join(out, ""))

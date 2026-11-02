@@ -12,12 +12,6 @@ builds one back. It opens no socket.
 [smtp-nv](https://novo-lang.org/packages/smtp-nv) sends what this package
 builds, and [dkim-nv](https://novo-lang.org/packages/dkim-nv) signs it.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is declared
-with its full signature, but every body is a `todo()` that panics when
-called. The package is published so its design can be reviewed and
-depended on before it is implemented. Version 0.1.0 will be the first
-working release.
-
 ## What a message is
 
 A message is a **header section**, a blank line, and a **body**. The
@@ -108,10 +102,8 @@ fn main() [io]
                 println("attachment: ${mailmime.filename_of(part)}")
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test`
-fails on purpose: every test reaches a
-`not implemented: mail-nv.<module>.<fn>` panic. The tests are the
-specification the implementation will have to satisfy.
+Build and test with `novo pkg build` and `novo test`. The tests are the
+specification the implementation has to satisfy.
 
 ## What the package contains
 
@@ -270,6 +262,7 @@ novo test tests/mailhdr_tests.nv     # folding, field order, dates, identifiers
 novo test tests/mailmime_tests.nv    # media types, transfer encodings, the tree
 novo test tests/mailmsg_tests.nv     # a message read, and a message built
 novo test tests/mailerror_tests.nv   # the refusals
+novo test tests/mail_nv_edge_tests.nv  # the four rules the rest of the grammar leans on
 ```
 
 The normative sources are RFC 5322 for the message, RFC 2045 and RFC
@@ -290,37 +283,13 @@ that the space between adjacent encoded words is dropped, that a
 draft built here parses back to the same addresses and attachment
 octets, and that `build` leaves `Bcc:` out.
 
-The tests compile today and fail at run, each on the
-`not implemented: mail-nv.<module>.<fn>` panic that is its body. That is
-the expected state of an interface release. They turn green one at a
-time as bodies land.
-
-## Implementation status
-
-| Item | Implemented |
-| --- | --- |
-| `MailError` and its twenty reasons, `mailerror.offset_of`, `.code`, `.is_unrenderable`, `.is_truncated` | the type is declared |
-| `mailaddr.parse_address`, `.parse_entries`, `.mailboxes_of`, `.is_valid_addr_spec`, `.same_mailbox` | no |
-| `mailaddr.addr_spec`, `.named_address`, `.group`, `.format_addr_spec`, `.format_address`, `.format_entries` | no |
-| `mailword.parse_word`, `.decode_text`, `.decode_phrase`, `.needs_encoding`, `.encode_text`, `.encode_word` | no |
-| `mailword.charset_named`, `.charset_name`, `.encoding_name`, `.assemble_parameter`, `.split_parameter` | no |
-| `mailctype.parse_content_type`, `.format_content_type`, `.param_value`, `.with_param`, `.charset_of`, `.boundary_of` | no |
-| `mailctype.is_multipart`, `.is_message`, `.default_content_type`, `.content_type`, `.param` | no |
-| `mailctype.parse_disposition`, `.format_disposition`, `.disposition`, `.disposition_name`, `.disposition_is_attachment`, `.filename_of` | no |
-| `mailctype.parse_transfer_encoding`, `.transfer_encoding_name` | no |
-| `mailhdr.parse_headers`, `.value_of`, `.values_of`, `.field_count`, `.append`, `.prepend`, `.without`, `.headers`, `.field` | no |
-| `mailhdr.unfold`, `.fold`, `.format_headers` | no |
-| `mailhdr.parse_date`, `.format_date`, `.datetime` | no |
-| `mailhdr.message_id`, `.parse_message_id`, `.parse_message_ids`, `.format_message_id`, `.addresses_of` | no |
-| `mailxfer.span`, `.slice`, `.decode`, `.encode`, `.choose_encoding`, `.to_crlf`, `.to_lf` | no |
-| `mailxfer.decode_base64`, `.encode_base64`, `.decode_quoted_printable`, `.encode_quoted_printable` | no |
-| `mailmime.parse_part`, `.format_part`, `.leaf_part`, `.multipart_part`, `.fresh_boundary` | no |
-| `mailmime.decoded_body`, `.decoded_text`, `.walk_order`, `.display_parts`, `.text_part`, `.html_part` | no |
-| `mailmime.attachments_of`, `.filename_of`, `.part_by_content_id` | no |
-| `mailmsg.parse`, `.subject_of`, `.from_of`, `.recipients_of`, `.date_of`, `.message_id_of`, `.thread_parents_of`, `.text_of`, `.part_bytes` | no |
-| `mailmsg.raw_header_span`, `.raw_body_span` | no |
-| `mailmsg.draft` and the fourteen `with_` builders, `.in_reply_to`, `.attachment`, `.inline_attachment` | no |
-| `mailmsg.build`, `.build_with_bcc` | no |
+`tests/mail_nv_edge_tests.nv` pins the four rules the rest of the
+grammar leans on, from raw octets rather than from values this package
+made itself: a folded subject and a folded address list; a comma inside
+a quoted display name and a parenthesised comment, neither of which is a
+separator or a name; a `Date:` with a named zone and one with a
+two-digit year; and a message with no body at all, beside one whose
+body's first line looks like a header field.
 
 ## Licence
 

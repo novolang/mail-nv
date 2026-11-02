@@ -1,0 +1,204 @@
+// mail_nv_edge_tests.nv — the four rules the README calls the ones that
+// break everything else, pinned from raw octets rather than from
+// values this package made itself.
+//
+//   1. A field body may be folded, and unfolding it must give the
+//      value back exactly.  A parser that forgets sees half a subject
+//      and half a recipient list.
+//   2. An address is not a string.  A comma inside a quoted display
+//      name is part of the name, and a parenthesised comment is part
+//      of the grammar and not a name.
+//   3. `Date:` has obsolete forms in the archives.  A named zone and a
+//      two-digit year both have to read, and neither may be written
+//      back out.
+//   4. The body begins at the first blank line.  It may be empty, and
+//      a line of it that looks like a header field is body text.
+
+use std.test
+use mailaddr
+use mailhdr
+use mailmsg
+
+@test
+fn test_a_folded_subject_unfolds_to_one_value() [io]
+    // RFC 5322 § 2.2.3: the CRLF before the whitespace is removed and
+    // the whitespace stays.
+    let src = bytes.from_str("Subject: a subject\r\n that was folded\r\n\r\nbody")
+    match mailmsg.parse(src, 32)
+        Ok(m)  =>
+            test.assert_eq_str(mailmsg.subject_of(m), "a subject that was folded")
+            test.case("and the field the parser kept is already unfolded")
+            test.assert_eq_str(m.headers.fields[0].value, "a subject that was folded")
+        Err(e) => test.fail(e.message())
+
+    test.case("a CRLF that is not followed by whitespace is not a fold")
+    test.assert_eq_str(mailhdr.unfold("Subject: a\r\nX-B: b"), "Subject: a\r\nX-B: b")
+
+@test
+fn test_a_folded_address_list_is_every_address_it_names() [io]
+    // The list is folded between two addresses, which is exactly where
+    // a parser that split the raw octets on a line break loses one.
+    let src = bytes.from_str("To: Ada <ada@example.com>,\r\n Alan <alan@example.com>\r\n\r\n")
+    match mailmsg.parse(src, 32)
+        Ok(m)  =>
+            match mailmsg.recipients_of(m)
+                Ok(rs) => test.assert_eq(list.len(rs), 2)
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+    test.case("and a value this package folded parses back to the same addresses")
+    let value = "ada@example.com, alan@example.com, grace@example.com, hopper@example.com"
+    let field = mailhdr.fold("To", value, 30)
+    test.assert_true(str.contains(field, "\r\n "), "the value is long enough to fold")
+    match mailhdr.parse_headers(bytes.from_str("${field}\r\n\r\n"), 0)
+        Ok(p)  =>
+            match mailhdr.addresses_of(p.headers, "to")
+                Ok(es) => test.assert_eq(list.len(es), 4)
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_comma_inside_a_display_name_is_not_a_separator() [io]
+    // Splitting the field on commas gives three addresses here, and
+    // two of them are halves of one person's name.
+    let src = bytes.from_str("To: \"Doe, John\" <j@d.example>, ada@example.com\r\n\r\n")
+    match mailmsg.parse(src, 32)
+        Ok(m)  =>
+            match mailmsg.recipients_of(m)
+                Ok(rs) => test.assert_eq(list.len(rs), 2)
+                Err(e) => test.fail(e.message())
+            match mailmsg.from_of(m)
+                Ok(_)  => ()
+                Err(_) => ()
+        Err(e) => test.fail(e.message())
+
+    test.case("and the quoted name is the name, comma and all")
+    match mailaddr.parse_address("\"Doe, John\" <j@d.example>")
+        Ok(a)  =>
+            test.assert_eq_str(a.display_name, "Doe, John")
+            test.assert_eq_str(a.local_part, "j")
+            test.assert_eq_str(a.domain, "d.example")
+        Err(e) => test.fail(e.message())
+
+    test.case("a comma in an ordinary name is quoted on the way out")
+    let a = mailaddr.named_address("Doe, John", "j", "d.example")
+    test.assert(str.contains(mailaddr.format_address(a), "\"Doe, John\""))
+
+@test
+fn test_a_comment_is_grammar_and_not_a_name() [io]
+    // RFC 5322 § 3.2.2 puts a comment in the same place a display name
+    // could stand.  Reading one as the name would invent a display
+    // name the sender did not write; reading it as part of the address
+    // would invent an address.
+    match mailaddr.parse_address("ada@example.com (Ada Lovelace)")
+        Ok(a)  =>
+            test.assert_eq_str(a.local_part, "ada")
+            test.assert_eq_str(a.domain, "example.com")
+            test.assert_eq_str(a.display_name, "")
+        Err(e) => test.fail(e.message())
+
+    test.case("a comment does not split an address list either")
+    match mailaddr.parse_entries("ada@example.com (Ada, of the Lovelaces), alan@example.com")
+        Ok(es) => test.assert_eq(list.len(es), 2)
+        Err(e) => test.fail(e.message())
+
+    test.case("and a parenthesis inside a quoted name is not a comment")
+    match mailaddr.parse_address("\"Ada (the first)\" <ada@example.com>")
+        Ok(a)  => test.assert_eq_str(a.display_name, "Ada (the first)")
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_date_may_name_an_obsolete_zone() [io]
+    // RFC 5322 § 4.3.  The name is read and never written: the one
+    // form § 3.3 specifies is the numeric offset.
+    match mailhdr.parse_date("Fri, 21 Nov 1997 09:55:06 GMT")
+        Ok(d)  =>
+            test.assert_eq(d.offset_minutes, 0)
+            test.assert(d.offset_known)
+            test.assert_eq_str(mailhdr.format_date(d), "Fri, 21 Nov 1997 09:55:06 +0000")
+        Err(e) => test.fail(e.message())
+
+    test.case("an alphabetic zone this package knows is an offset and not a name")
+    match mailhdr.parse_date("Fri, 21 Nov 1997 09:55:06 EST")
+        Ok(d)  => test.assert_eq(d.offset_minutes, -300)
+        Err(e) => test.fail(e.message())
+
+    test.case("and a comment between the components is skipped, not refused")
+    match mailhdr.parse_date("Fri, 21 Nov 1997 09:55:06 -0600 (CST)")
+        Ok(d)  => test.assert_eq(d.offset_minutes, -360)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_two_digit_year_reads_as_the_century_it_means() [io]
+    match mailhdr.parse_date("21 Nov 97 09:55:06 -0600")
+        Ok(d)  =>
+            test.assert_eq(d.local.date.year, 1997)
+            test.assert_eq_str(mailhdr.format_date(d), "Fri, 21 Nov 1997 09:55:06 -0600")
+        Err(e) => test.fail(e.message())
+
+    test.case("and one that has not happened yet is this century")
+    match mailhdr.parse_date("21 Nov 30 09:55:06 -0600")
+        Ok(d)  => test.assert_eq(d.local.date.year, 2030)
+        Err(e) => test.fail(e.message())
+
+    test.case("the dashed form the archives are full of reads too")
+    match mailhdr.parse_date("21-Nov-97 09:55:06 -0600")
+        Ok(d)  => test.assert_eq(d.local.date.year, 1997)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_message_may_have_no_body_at_all() [io]
+    // The blank line is what ends the header section, and there may be
+    // nothing after it.  A field ending the file is truncated
+    // (RFC 5322 § 2.1's empty line never arrived); an empty line
+    // ending the file is a message with no body.
+    let src = bytes.from_str("Subject: Hi\r\n\r\n")
+    match mailhdr.parse_headers(src, 0)
+        Ok(p)  =>
+            test.assert_eq(list.len(p.headers.fields), 1)
+            test.assert_eq(p.body_offset, bytes.len(src))
+        Err(e) => test.fail(e.message())
+
+    match mailmsg.parse(src, 32)
+        Ok(m)  =>
+            test.assert_eq(mailmsg.raw_body_span(m).len, 0)
+            match mailmsg.text_of(m)
+                Ok(s)  => test.assert_eq_str(s, "")
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_body_line_that_looks_like_a_header_is_body() [io]
+    // Nothing after the first blank line is scanned for fields, which
+    // is what makes a saved message forwardable byte for byte.
+    let src = bytes.from_str("Subject: Hi\r\n\r\nX-Not-A-Header: value\r\nFrom: nobody@example.com\r\n")
+    match mailmsg.parse(src, 32)
+        Ok(m)  =>
+            test.assert_eq(list.len(m.headers.fields), 1)
+            test.assert_eq_str(mailhdr.value_of(m.headers, "from"), "")
+            match mailmsg.text_of(m)
+                Ok(s)  =>
+                    test.assert(str.starts_with(s, "X-Not-A-Header: value"))
+                    test.assert(str.contains(s, "From: nobody@example.com"))
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+    test.case("and indentation on the first body line does not make it a continuation")
+    match mailmsg.parse(bytes.from_str("Subject: Hi\r\n\r\n indented body\r\n"), 32)
+        Ok(m)  =>
+            match mailmsg.text_of(m)
+                Ok(s)  => test.assert(str.starts_with(s, " indented body"))
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+    test.case("the same rule holds inside a part of a multipart")
+    let multipart = bytes.from_str("Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nSubject: this is body text\r\n--b--\r\n")
+    match mailmsg.parse(multipart, 32)
+        Ok(m)  =>
+            test.assert_eq(list.len(m.root.children), 1)
+            let part = m.root.children[0]
+            test.assert_eq(mailhdr.field_count(part.headers, "subject"), 0)
+            match mailmsg.part_bytes(m, part)
+                Ok(b)  => test.assert(str.starts_with(bytes.to_str(b), "Subject: this is body text"))
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())

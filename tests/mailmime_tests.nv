@@ -1,8 +1,5 @@
 // mailmime_tests.nv — the MIME layer: media types and their
 // parameters, the transfer encodings, and the tree.
-//
-// RED ON PURPOSE: every assertion reaches `not implemented:
-// mail-nv.<module>.<fn>`.
 
 use std.test
 use mailctype

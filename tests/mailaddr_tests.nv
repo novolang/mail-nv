@@ -1,9 +1,5 @@
 // mailaddr_tests.nv — the address grammar of RFC 5322 § 3.4, against
 // the examples the specification itself prints.
-//
-// RED ON PURPOSE: every assertion reaches `not implemented:
-// mail-nv.mailaddr.<fn>`.  The suite is the specification the
-// implementation will have to satisfy.
 
 use std.test
 use mailaddr

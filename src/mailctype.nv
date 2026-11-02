@@ -28,10 +28,180 @@
 // A `filename*0*=utf-8''...` parameter set is assembled by `mailword`
 // before a `MailParam` exists, so `param_value("filename")` answers
 // the finished text and no caller ever meets a section number.  The
-// raw sections are still reachable through `raw_params`, for the same
+// sections themselves are `mailword`'s to write and read —
+// `split_parameter` and `assemble_parameter` are both public — and
+// `MailParam` keeps the finished value, for the same
 // reproduce-it-exactly reason the order is kept.
 
 use mailerror
+use mailword
+
+// ── Private helpers ──────────────────────────────────────────────────
+
+// Whether an octet may appear in a `token` (RFC 2045 § 5.1).
+fn token_byte(b: Int) -> Bool
+    if b <= ' ' or b >= 127
+        return false
+    b != '(' and b != ')' and b != '<' and b != '>' and b != '@' and b != ','
+        and b != ';' and b != ':' and b != '\\' and b != '"' and b != '/'
+        and b != '[' and b != ']' and b != '?' and b != '='
+
+// The next octet that is not FWS.  A value that arrived folded is read
+// by this, so folding is not a parse error.
+fn skip_fws(s: Str, from: Int) -> Int
+    let n = str.len(s)
+    var i = from
+    while i < n
+        let b = str.byte_at_or(s, i, 0)
+        if b != ' ' and b != '\t' and b != '\r' and b != '\n'
+            break
+        i = i + 1
+    i
+
+// The base name of a parameter that carries an RFC 2231 section marker
+// (`name*`, `name*0`, `name*0*`), or `None` when it is a plain one.
+fn section_base(name: Str) -> ?Str
+    var end = str.len(name)
+    if end > 0 and str.byte_at_or(name, end - 1, 0) == '*'
+        end = end - 1
+    var k = end
+    while k > 0
+        let b = str.byte_at_or(name, k - 1, 0)
+        if b < '0' or b > '9'
+            break
+        k = k - 1
+    if k >= end
+        if end == str.len(name)
+            return None
+        return Some(str.slice(name, 0, end))
+    if k > 0 and str.byte_at_or(name, k - 1, 0) == '*'
+        return Some(str.slice(name, 0, k - 1))
+    None
+
+// Every pair in `raw` whose base name is `base`, in the order written.
+fn group_of(raw: [(Str, Str)], base: Str) -> [(Str, Str)]
+    var out: [(Str, Str)] = []
+    for pair in raw
+        match section_base(pair.0)
+            Some(b) =>
+                if b == base
+                    list.push(out, pair)
+            None    => ()
+    out
+
+// The raw parameters with every RFC 2231 continuation assembled, each
+// finished parameter in the position its first section held.
+fn assemble_params(raw: [(Str, Str)]) -> Result<[MailParam], mailerror.MailError>
+    var out: [MailParam] = []
+    var seen: [Str] = []
+    var i = 0
+    while i < list.len(raw)
+        let pair = raw[i]
+        match section_base(pair.0)
+            None       =>
+                list.push(out, MailParam { name: pair.0, value: pair.1 })
+            Some(base) =>
+                if not list.contains(seen, base)
+                    list.push(seen, base)
+                    let assembled = mailword.assemble_parameter(base, group_of(raw, base))!
+                    list.push(out, MailParam { name: base, value: assembled })
+        i = i + 1
+    Ok(out)
+
+// The `name=value` pairs of a parameter list, from `from` to the end.
+fn parse_params(s: Str, from: Int) -> Result<[(Str, Str)], mailerror.MailError>
+    var out: [(Str, Str)] = []
+    let n = str.len(s)
+    var at = skip_fws(s, from)
+    while at < n
+        if str.byte_at_or(s, at, 0) != ';'
+            return Err(MailBadContentType(at, "a parameter is not preceded by a semicolon"))
+        at = skip_fws(s, at + 1)
+        let ns = at
+        while at < n
+            if not token_byte(str.byte_at_or(s, at, 0))
+                break
+            at = at + 1
+        if at == ns
+            return Err(MailBadContentType(ns, "the parameter name is missing"))
+        let nend = at
+        at = skip_fws(s, at)
+        if at >= n or str.byte_at_or(s, at, 0) != '='
+            return Err(MailBadContentType(at, "the parameter has no value"))
+        at = skip_fws(s, at + 1)
+        let vs = at
+        var buf: [Str] = []
+        if at < n and str.byte_at_or(s, at, 0) == '"'
+            at = at + 1
+            while at < n and str.byte_at_or(s, at, 0) != '"'
+                if str.byte_at_or(s, at, 0) == '\\' and at + 1 < n
+                    list.push(buf, str.slice(s, at + 1, at + 2))
+                    at = at + 2
+                else
+                    list.push(buf, str.slice(s, at, at + 1))
+                    at = at + 1
+            if at >= n
+                return Err(MailBadContentType(vs, "the quoted value is not closed"))
+            at = at + 1
+        else
+            while at < n
+                if not token_byte(str.byte_at_or(s, at, 0))
+                    break
+                at = at + 1
+            if at == vs
+                return Err(MailBadContentType(vs, "the parameter value is missing"))
+            list.push(buf, str.slice(s, vs, at))
+        // The name is cut out of `s` only here, after this pass's last
+        // refusal: a call the tail moves must not be live on a path that
+        // returns early (novo 0.20.2 strands that reference; see the
+        // CHANGELOG note and the filing it sights).
+        list.push(out, (str.lower(str.slice(s, ns, nend)), str.join(buf, "")))
+        at = skip_fws(s, at)
+    Ok(out)
+
+// Whether a parameter value has to be written as a quoted string.
+fn needs_quoting(value: Str) -> Bool
+    let n = str.len(value)
+    var i = 0
+    while i < n
+        let b = str.byte_at_or(value, i, 0)
+        if not token_byte(b)
+            return true
+        i = i + 1
+    false
+
+// The quoted-string form of a parameter value, with `"` and `\`
+// escaped.
+fn quote_param(value: Str) -> Str
+    if not needs_quoting(value)
+        return value
+    var buf: [Str] = []
+    let n = str.len(value)
+    var i = 0
+    while i < n
+        let b = str.byte_at_or(value, i, 0)
+        if b == '"' or b == '\\'
+            // cov: skip — split_parameter percent-encodes a quote or a backslash, so the piece never has one
+            list.push(buf, "\\")
+        list.push(buf, str.slice(value, i, i + 1))
+        i = i + 1
+    "\"${str.join(buf, "")}\""
+
+// A parameter list written back as a field value.
+fn format_params(params: [MailParam]) -> Str
+    var parts: [Str] = []
+    for p in params
+        for pair in mailword.split_parameter(p.name, p.value, MailUsAscii)
+            list.push(parts, "; ${pair.0}=${quote_param(pair.1)}")
+    str.join(parts, "")
+
+// The first value written for a parameter name, or `""`.
+fn param_of(params: [MailParam], name: Str) -> Str
+    let key = str.lower(name)
+    for p in params
+        if p.name == key
+            return p.value
+    ""
 
 // One `Content-Type` or `Content-Disposition` parameter.
 //
@@ -133,7 +303,7 @@ pub enum MailTransferEncoding
 //     println(mailctype.param("boundary", "sep").value)   // sep
 // ```
 pub fn param(name: Str, value: Str) -> MailParam
-    todo("mail-nv.mailctype.param")
+    MailParam { name: str.lower(name), value: value }
 
 // A media type from its parts.
 //
@@ -144,7 +314,10 @@ pub fn param(name: Str, value: Str) -> MailParam
 //     println(mailctype.format_content_type(mailctype.content_type("text", "plain", [])))
 // ```
 pub fn content_type(type_name: Str, subtype: Str, params: [MailParam]) -> MailContentType
-    todo("mail-nv.mailctype.content_type")
+    MailContentType {
+        type_name: str.lower(type_name),
+        subtype: str.lower(subtype),
+        params: params }
 
 // `text/plain; charset=us-ascii`, the type RFC 2045 § 5.2 says a part
 // with no `Content-Type` field has.
@@ -160,7 +333,7 @@ pub fn content_type(type_name: Str, subtype: Str, params: [MailParam]) -> MailCo
 //     println(mailctype.default_content_type().subtype)   // plain
 // ```
 pub fn default_content_type() -> MailContentType
-    todo("mail-nv.mailctype.default_content_type")
+    content_type("text", "plain", [param("charset", "us-ascii")])
 
 // A `Content-Type` field value parsed.
 //
@@ -177,7 +350,44 @@ pub fn default_content_type() -> MailContentType
 //         Err(e) => println(e.message())
 // ```
 pub fn parse_content_type(value: Str) -> Result<MailContentType, mailerror.MailError>
-    todo("mail-nv.mailctype.parse_content_type")
+    let n = str.len(value)
+    var at = skip_fws(value, 0)
+    let ts = at
+    while at < n
+        if not token_byte(str.byte_at_or(value, at, 0))
+            break
+        at = at + 1
+    if at == ts
+        return Err(MailBadContentType(ts, "the type is missing"))
+    let tend = at
+    at = skip_fws(value, at)
+    if at >= n or str.byte_at_or(value, at, 0) != '/'
+        return Err(MailBadContentType(at, "the subtype is not preceded by a slash"))
+    at = skip_fws(value, at + 1)
+    let ss = at
+    while at < n
+        if not token_byte(str.byte_at_or(value, at, 0))
+            break
+        at = at + 1
+    if at == ss
+        return Err(MailBadContentType(ss, "the subtype is missing"))
+    let send = at
+    let raw = parse_params(value, at)!
+    let params = assemble_params(raw)!
+    // The two names are cut out of `value` only here, after the last
+    // refusal.  A call whose result the tail moves must not still be
+    // live on a path that returns early: novo 0.20.2 strands that
+    // reference, which is the leak `novo test` reports as exit 23.
+    // Sights memory-perceus/
+    // an-early-return-skips-the-release-of-a-call-bound-local-the-tail-moves
+    // (closed, fixed_in 0.20.3 — past this package's `>= 0.20.2`
+    // floor), and the CHANGELOG's `Worked around` bullet.
+    // REVERT once the floor moves past 0.20.2 and the leak no longer
+    // reproduces.
+    Ok(MailContentType {
+        type_name: str.lower(str.slice(value, ts, tend)),
+        subtype: str.lower(str.slice(value, ss, send)),
+        params: params })
 
 // A media type written back as a field value, quoted and folded.
 //
@@ -192,7 +402,7 @@ pub fn parse_content_type(value: Str) -> Result<MailContentType, mailerror.MailE
 //     println(mailctype.format_content_type(mailctype.content_type("image", "png", [])))
 // ```
 pub fn format_content_type(ct: MailContentType) -> Str
-    todo("mail-nv.mailctype.format_content_type")
+    "${ct.type_name}/${ct.subtype}${format_params(ct.params)}"
 
 // The value of a named parameter, or `""`.
 //
@@ -208,7 +418,7 @@ pub fn format_content_type(ct: MailContentType) -> Str
 //     println(mailctype.param_value(ct, "CHARSET"))       // utf-8
 // ```
 pub fn param_value(ct: MailContentType, name: Str) -> Str
-    todo("mail-nv.mailctype.param_value")
+    param_of(ct.params, name)
 
 // The media type with a parameter added, or replaced when it is
 // already there.
@@ -221,7 +431,19 @@ pub fn param_value(ct: MailContentType, name: Str) -> Str
 //     println(mailctype.param_value(ct, "charset"))       // utf-8
 // ```
 pub fn with_param(ct: MailContentType, name: Str, value: Str) -> MailContentType
-    todo("mail-nv.mailctype.with_param")
+    let key = str.lower(name)
+    var kept: [MailParam] = []
+    var replaced = false
+    for p in ct.params
+        if p.name == key
+            if not replaced
+                list.push(kept, MailParam { name: key, value: value })
+                replaced = true
+        else
+            list.push(kept, p)
+    if not replaced
+        list.push(kept, MailParam { name: key, value: value })
+    MailContentType { type_name: ct.type_name, subtype: ct.subtype, params: kept }
 
 // The `charset` parameter as a `mailword.MailCharset` name, or
 // `"us-ascii"` when there is none.
@@ -237,7 +459,12 @@ pub fn with_param(ct: MailContentType, name: Str, value: Str) -> MailContentType
 //     println(mailctype.charset_of(mailctype.content_type("text", "plain", [])))
 // ```
 pub fn charset_of(ct: MailContentType) -> Str
-    todo("mail-nv.mailctype.charset_of")
+    let written = param_of(ct.params, "charset")
+    if written == ""
+        return "us-ascii"
+    match mailword.charset_named(written)
+        Some(c) => mailword.charset_name(c)
+        None    => written
 
 // The `boundary` parameter of a `multipart/*` type, or `""`.
 //
@@ -254,7 +481,7 @@ pub fn charset_of(ct: MailContentType) -> Str
 //     println(mailctype.boundary_of(ct))                  // sep
 // ```
 pub fn boundary_of(ct: MailContentType) -> Str
-    todo("mail-nv.mailctype.boundary_of")
+    param_of(ct.params, "boundary")
 
 // Whether the type is `multipart/*` — a part whose body is other
 // parts.
@@ -266,7 +493,7 @@ pub fn boundary_of(ct: MailContentType) -> Str
 //     println("${mailctype.is_multipart(mailctype.content_type("multipart", "mixed", []))}")
 // ```
 pub fn is_multipart(ct: MailContentType) -> Bool
-    todo("mail-nv.mailctype.is_multipart")
+    ct.type_name == "multipart"
 
 // Whether the type is `message/rfc822` or `message/global` — a part
 // whose body is a whole message.
@@ -278,7 +505,9 @@ pub fn is_multipart(ct: MailContentType) -> Bool
 //     println("${mailctype.is_message(mailctype.content_type("message", "rfc822", []))}")
 // ```
 pub fn is_message(ct: MailContentType) -> Bool
-    todo("mail-nv.mailctype.is_message")
+    if ct.type_name != "message"
+        return false
+    ct.subtype == "rfc822" or ct.subtype == "global"
 
 // A disposition from its parts.
 //
@@ -289,7 +518,7 @@ pub fn is_message(ct: MailContentType) -> Bool
 //     println(mailctype.disposition_name(mailctype.disposition(MailInlineDisposition, []).kind))
 // ```
 pub fn disposition(kind: MailDispositionKind, params: [MailParam]) -> MailDisposition
-    todo("mail-nv.mailctype.disposition")
+    MailDisposition { kind: kind, params: params }
 
 // A `Content-Disposition` field value parsed.
 //
@@ -302,7 +531,30 @@ pub fn disposition(kind: MailDispositionKind, params: [MailParam]) -> MailDispos
 //         Err(e) => println(e.message())
 // ```
 pub fn parse_disposition(value: Str) -> Result<MailDisposition, mailerror.MailError>
-    todo("mail-nv.mailctype.parse_disposition")
+    let n = str.len(value)
+    var at = skip_fws(value, 0)
+    let ks = at
+    while at < n
+        if not token_byte(str.byte_at_or(value, at, 0))
+            break
+        at = at + 1
+    if at == ks
+        return Err(MailBadContentType(ks, "the disposition type is missing"))
+    let kend = at
+    let raw = parse_params(value, at)!
+    let params = assemble_params(raw)!
+    // The written type is cut out of `value` only here, after the last
+    // refusal: a call the tail moves must not be live on a path that
+    // returns early (novo 0.20.2 strands that reference; see the
+    // CHANGELOG note and the filing it sights).
+    let written = str.slice(value, ks, kend)
+    let key = str.lower(written)
+    var kind = MailOtherDisposition(written)
+    if key == "inline"
+        kind = MailInlineDisposition
+    elif key == "attachment"
+        kind = MailAttachmentDisposition
+    Ok(MailDisposition { kind: kind, params: params })
 
 // A disposition written back as a field value.
 //
@@ -313,7 +565,7 @@ pub fn parse_disposition(value: Str) -> Result<MailDisposition, mailerror.MailEr
 //     println(mailctype.format_disposition(mailctype.disposition(MailInlineDisposition, [])))
 // ```
 pub fn format_disposition(d: MailDisposition) -> Str
-    todo("mail-nv.mailctype.format_disposition")
+    "${disposition_name(d.kind)}${format_params(d.params)}"
 
 // The name a disposition kind is written with: `"inline"`,
 // `"attachment"`, or whatever an unknown one carried.
@@ -325,7 +577,10 @@ pub fn format_disposition(d: MailDisposition) -> Str
 //     println(mailctype.disposition_name(MailOtherDisposition("form-data")))
 // ```
 pub fn disposition_name(k: MailDispositionKind) -> Str
-    todo("mail-nv.mailctype.disposition_name")
+    match k
+        MailInlineDisposition      => "inline"
+        MailAttachmentDisposition  => "attachment"
+        MailOtherDisposition(name) => name
 
 // Whether a part should be offered as a file rather than shown.
 //
@@ -342,7 +597,9 @@ pub fn disposition_name(k: MailDispositionKind) -> Str
 //     println("${mailctype.disposition_is_attachment(d)}")   // true
 // ```
 pub fn disposition_is_attachment(d: MailDisposition) -> Bool
-    todo("mail-nv.mailctype.disposition_is_attachment")
+    match d.kind
+        MailInlineDisposition => param_of(d.params, "filename") != ""
+        _                     => true
 
 // The `filename` parameter, assembled from its RFC 2231 sections if it
 // had any, or `""`.
@@ -361,7 +618,7 @@ pub fn disposition_is_attachment(d: MailDisposition) -> Bool
 //     println(mailctype.filename_of(d))                   // a.txt
 // ```
 pub fn filename_of(d: MailDisposition) -> Str
-    todo("mail-nv.mailctype.filename_of")
+    param_of(d.params, "filename")
 
 // The transfer encoding a `Content-Transfer-Encoding` value names.
 //
@@ -380,7 +637,18 @@ pub fn filename_of(d: MailDisposition) -> Str
 //         Err(e) => println(e.message())
 // ```
 pub fn parse_transfer_encoding(value: Str) -> Result<MailTransferEncoding, mailerror.MailError>
-    todo("mail-nv.mailctype.parse_transfer_encoding")
+    let key = str.lower(str.trim(value))
+    if key == "7bit"
+        return Ok(MailSevenBit)
+    if key == "8bit"
+        return Ok(MailEightBit)
+    if key == "binary"
+        return Ok(MailBinary)
+    if key == "quoted-printable"
+        return Ok(MailQuotedPrintable)
+    if key == "base64"
+        return Ok(MailBase64Encoding)
+    Err(MailUnknownTransferEncoding(str.trim(value)))
 
 // The name a transfer encoding is written with: `"7bit"`, `"8bit"`,
 // `"binary"`, `"quoted-printable"`, `"base64"`.
@@ -392,4 +660,9 @@ pub fn parse_transfer_encoding(value: Str) -> Result<MailTransferEncoding, maile
 //     println(mailctype.transfer_encoding_name(MailSevenBit))   // 7bit
 // ```
 pub fn transfer_encoding_name(e: MailTransferEncoding) -> Str
-    todo("mail-nv.mailctype.transfer_encoding_name")
+    match e
+        MailSevenBit        => "7bit"
+        MailEightBit        => "8bit"
+        MailBinary          => "binary"
+        MailQuotedPrintable => "quoted-printable"
+        MailBase64Encoding  => "base64"

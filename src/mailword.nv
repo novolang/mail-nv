@@ -36,7 +36,493 @@
 
 use mailerror
 
-// The two encodings an encoded word may use, RFC 2047 § 4.
+// ── Private helpers ──────────────────────────────────────────────────
+
+// The uppercase hexadecimal character the low nibble of `v` is written
+// with.
+fn hex_char(v: Int) -> Str
+    let d = v % 16
+    if d < 10
+        return str.from_byte(48 + d)
+    str.from_byte(55 + d)
+
+// The value a hexadecimal character denotes, or `-1`.
+fn hex_value(b: Int) -> Int
+    if b >= '0' and b <= '9'
+        return b - 48
+    if b >= 'A' and b <= 'F'
+        return b - 55
+    if b >= 'a' and b <= 'f'
+        return b - 87
+    -1
+
+// ISO-8859-1 octets as UTF-8 text: every octet above 127 becomes the
+// two-octet encoding of its code point.
+fn latin1_to_utf8(data: Bytes) -> Str
+    var out: [Int] = []
+    let n = bytes.len(data)
+    var i = 0
+    while i < n
+        let b = bytes.byte_at(data, i) ?? 0
+        if b < 128
+            list.push(out, b)
+        else
+            list.push(out, 192 + b / 64)
+            list.push(out, 128 + b % 64)
+        i = i + 1
+    bytes.byte_list_to_str(out)
+
+// The ISO-8859-1 octets for UTF-8 text.  A code point above 255 has no
+// ISO-8859-1 octet and becomes `?`.
+fn utf8_to_latin1(text: Str) -> Bytes
+    var out: [Int] = []
+    let n = str.len(text)
+    var i = 0
+    while i < n
+        let b = str.byte_at_or(text, i, 0)
+        match b
+            0..=127                =>
+                list.push(out, b)
+                i = i + 1
+            128..=223 if i + 1 < n =>
+                let cp = (b - 192) * 64 + (str.byte_at_or(text, i + 1, 128) - 128)
+                if cp < 256
+                    list.push(out, cp)
+                else
+                    list.push(out, 63)
+                i = i + 2
+            224..=239 if i + 2 < n =>
+                let cp = (b - 224) * 4096
+                    + (str.byte_at_or(text, i + 1, 128) - 128) * 64
+                    + (str.byte_at_or(text, i + 2, 128) - 128)
+                if cp < 256
+                    list.push(out, cp)
+                else
+                    list.push(out, 63)
+                i = i + 3
+            _                      =>
+                list.push(out, 63)
+                i = i + 1
+                // A four-octet character is one code point, not four.  The
+                // octets that continue it are consumed here, or the next
+                // iteration reads a continuation octet as a lead and packs
+                // a negative code point into the byte list.
+                while i < n and str.byte_at_or(text, i, 0) >= 128 and str.byte_at_or(text, i, 0) < 192
+                    i = i + 1
+    bytes.from_byte_list(out)
+
+// The octets of UTF-8 text in the character set named, ready to be
+// encoded into an encoded word.
+fn charset_bytes(c: MailCharset, text: Str) -> Bytes
+    match c
+        MailLatin1 => utf8_to_latin1(text)
+        _          => bytes.from_str(text)
+
+// Octets in a named character set, as UTF-8 text.
+fn charset_text(c: MailCharset, data: Bytes) -> Str
+    match c
+        MailLatin1  => latin1_to_utf8(data)
+        MailUsAscii => bytes.to_str(data)
+        MailUtf8    => bytes.to_str(data)
+
+// Whether the octets are printable US-ASCII.
+fn printable_ascii(data: Bytes) -> Bool
+    let n = bytes.len(data)
+    var i = 0
+    while i < n
+        let b = bytes.byte_at(data, i) ?? 0
+        if b < ' ' or b > '~'
+            return false
+        i = i + 1
+    true
+
+// The octets a percent-encoded string names.  A `%` that is not
+// followed by two hexadecimal digits is a literal `%`, which is what
+// RFC 2231 § 3 says a sender must not write and what a receiver reads
+// anyway.
+fn percent_bytes(text: Str) -> Bytes
+    var out: [Int] = []
+    let n = str.len(text)
+    var i = 0
+    while i < n
+        let b = str.byte_at_or(text, i, 0)
+        if b == '%' and i + 3 <= n
+            let hi = hex_value(str.byte_at_or(text, i + 1, 0))
+            let lo = hex_value(str.byte_at_or(text, i + 2, 0))
+            if hi >= 0 and lo >= 0
+                list.push(out, hi * 16 + lo)
+                i = i + 3
+            else
+                list.push(out, b)
+                i = i + 1
+        else
+            list.push(out, b)
+            i = i + 1
+    bytes.from_byte_list(out)
+
+// The percent-encoded form of octets, for RFC 2231 § 3.
+fn percent_encode(data: Bytes) -> Str
+    var parts: [Str] = []
+    let n = bytes.len(data)
+    var i = 0
+    while i < n
+        let b = bytes.byte_at(data, i) ?? 0
+        match b
+            45 | 46 | 95 | 126 => list.push(parts, str.from_byte(b))
+            48..=57            => list.push(parts, str.from_byte(b))
+            65..=90            => list.push(parts, str.from_byte(b))
+            97..=122           => list.push(parts, str.from_byte(b))
+            _                  => list.push(parts, "%${hex_char(b / 16)}${hex_char(b)}")
+        i = i + 1
+    str.join(parts, "")
+
+// The octets between the `=XX` escapes of an encoded word's `Q` text.
+fn decode_q_at(text: Str, base: Int) -> Result<Bytes, mailerror.MailError>
+    var out: [Int] = []
+    let n = str.len(text)
+    var i = 0
+    while i < n
+        let b = str.byte_at_or(text, i, 0)
+        match b
+            95 =>
+                list.push(out, 32)
+                i = i + 1
+            61 =>
+                if i + 3 > n
+                    return Err(MailBadEncodedWord(base + i))
+                let hi = hex_value(str.byte_at_or(text, i + 1, 0))
+                let lo = hex_value(str.byte_at_or(text, i + 2, 0))
+                if hi < 0 or lo < 0
+                    return Err(MailBadEncodedWord(base + i))
+                list.push(out, hi * 16 + lo)
+                i = i + 3
+            _  =>
+                list.push(out, b)
+                i = i + 1
+    Ok(bytes.from_byte_list(out))
+
+// Octets written as the `Q` text of an encoded word: printable ASCII
+// survives, and everything else is `=XX`.  `?` and `_` are in the
+// delimiters and in the space, so they are encoded too (RFC 2047 § 4.2).
+fn encode_q_bytes(data: Bytes) -> Str
+    var parts: [Str] = []
+    let n = bytes.len(data)
+    var i = 0
+    while i < n
+        let b = bytes.byte_at(data, i) ?? 0
+        match b
+            32                                                                => list.push(parts, "_")
+            _ if b >= '!' and b <= '~' and b != '=' and b != '?' and b != '_' => list.push(parts, str.from_byte(b))
+            _                                                                 => list.push(parts, "=${hex_char(b / 16)}${hex_char(b)}")
+        i = i + 1
+    str.join(parts, "")
+
+// Octets written as the `B` text of an encoded word.
+fn encode_b_bytes(data: Bytes) -> Str
+    bytes.to_base64(data)
+
+// The `B` text of an encoded word, decoded.
+fn decode_b_at(text: Str, base: Int) -> Result<Bytes, mailerror.MailError>
+    match bytes.from_base64(text)
+        Some(b) => Ok(b)
+        None    => Err(MailBadEncodedWord(base))
+
+// One encoded word's text, decoded and converted to UTF-8.
+fn decode_word(w: MailEncodedWord) -> Result<Str, mailerror.MailError>
+    if w.encoding == MailQEncoding
+        let b = decode_q_at(w.encoded_text, 0)!
+        return Ok(charset_text(w.charset, b))
+    let b = decode_b_at(w.encoded_text, 0)!
+    Ok(charset_text(w.charset, b))
+
+// Whether an encoded word begins at `i`.
+fn word_begins(text: Str, i: Int) -> Bool
+    if str.len(text) < i + 5
+        return false
+    str.byte_at_or(text, i, 0) == '=' and str.byte_at_or(text, i + 1, 0) == '?'
+
+// The offset just past the encoded word that opens at `i`, or `-1`
+// when it does not close on the same line — which is what makes a
+// malformed word literal text rather than a refusal.
+//
+// The word has two `?` of its own before its text (`=?` charset `?`
+// encoding `?` text `?=`), and a `Q` text may open with one of the
+// `=XX` escapes on either side of one.  The closing `?=` is therefore
+// the first one *after* the encoding's `?`, not the first one in the
+// word: `=?utf-8?Q?=C3=A9?=` would otherwise be cut before its own
+// text and its escapes would stay on the page.
+fn word_end(text: Str, i: Int) -> Int
+    match str.index_from(text, "?", i + 2)
+        None        => -1
+        Some(c_end) =>
+            match str.index_from(text, "?=", c_end + 3)
+                None    => -1
+                Some(j) =>
+                    let inside = str.slice(text, i, j)
+                    if str.contains(inside, "\r") or str.contains(inside, "\n")
+                        return -1
+                    j + 2
+
+// How far a run of linear whitespace reaches from `from`.
+fn whitespace_end(text: Str, from: Int) -> Int
+    let n = str.len(text)
+    var i = from
+    while i < n
+        let b = str.byte_at_or(text, i, 0)
+        if b != ' ' and b != '\t' and b != '\r' and b != '\n'
+            break
+        i = i + 1
+    i
+
+// The encoded word at `i`, decoded, with the offset just past it.
+// `Ok(None)` when no word opens there or the one that does is
+// malformed; `Err` when the word is well formed and names a character
+// set this package cannot convert.
+fn decode_word_at(text: Str, i: Int) -> Result<?(Str, Int), mailerror.MailError>
+    if not word_begins(text, i)
+        // cov: skip — the only caller has already asked `word_begins`
+        return Ok(None)
+    let end = word_end(text, i)
+    if end < 0
+        return Ok(None)
+    match parse_word(str.slice(text, i, end))
+        Err(MailBadEncodedWord(_)) => Ok(None)
+        Err(e)                     => Err(e)
+        Ok(w)                      =>
+            let s = decode_word(w)!
+            Ok(Some((s, end)))
+
+// A whole header value decoded.  With `respect_quotes`, an encoded word
+// inside a quoted string is literal text, which is the `phrase` rule of
+// RFC 2047 § 5.
+fn decode_words(text: Str, respect_quotes: Bool) -> Result<Str, mailerror.MailError>
+    var parts: [Str] = []
+    let n = str.len(text)
+    var i = 0
+    var in_quotes = false
+    var after_word = false
+    while i < n
+        let b = str.byte_at_or(text, i, 0)
+        if respect_quotes and b == '"'
+            in_quotes = not in_quotes
+            list.push(parts, "\"")
+            after_word = false
+            i = i + 1
+        elif respect_quotes and in_quotes and b == '\\' and i + 1 < n
+            list.push(parts, str.slice(text, i, i + 2))
+            after_word = false
+            i = i + 2
+        elif respect_quotes and in_quotes
+            list.push(parts, str.slice(text, i, i + 1))
+            after_word = false
+            i = i + 1
+        elif word_begins(text, i)
+            match decode_word_at(text, i)
+                Ok(Some(p)) =>
+                    list.push(parts, p.0)
+                    after_word = true
+                    i = p.1
+                Ok(None)    =>
+                    list.push(parts, str.slice(text, i, i + 1))
+                    after_word = false
+                    i = i + 1
+                Err(e)      =>
+                    return Err(e)
+        else
+            if after_word
+                let j = whitespace_end(text, i)
+                if j > i and word_begins(text, j)
+                    i = j
+                    continue
+            list.push(parts, str.slice(text, i, i + 1))
+            after_word = false
+            i = i + 1
+    Ok(str.join(parts, ""))
+
+// The longest line in a value, in octets.
+fn longest_line(text: Str) -> Int
+    let cut = str.replace(str.replace(text, "\r\n", "\n"), "\r", "\n")
+    var longest = 0
+    for line in str.split(cut, "\n")
+        if str.len(line) > longest
+            longest = str.len(line)
+    longest
+
+// The section index and form an RFC 2231 field name names, or `None`
+// when the name belongs to some other parameter.  `-1` is the plain,
+// unnumbered form.
+fn section_of(field: Str, base: Str) -> ?(Int, Bool)
+    if field == base
+        return Some((-1, false))
+    if not str.starts_with(field, "${base}*")
+        return None
+    let rest = str.slice(field, str.len(base) + 1, str.len(field))
+    if rest == ""
+        return Some((0, true))
+    if str.ends_with(rest, "*")
+        let digits = str.slice(rest, 0, str.len(rest) - 1)
+        match str.to_int(digits)
+            Some(k) =>
+                return Some((k, true))
+            None    =>
+                return None
+    match str.to_int(rest)
+        Some(k) => Some((k, false))
+        None    => None
+
+// Whether the numbered sections form `0 .. count - 1` with none missing
+// and none repeated.
+fn sections_are_contiguous(found: [(Int, Bool, Str)]) -> Bool
+    var idx: [Int] = []
+    for s in found
+        list.push(idx, s.0)
+    let ordered = list.sort(list.clone(idx))
+    var i = 0
+    while i < list.len(ordered)
+        if ordered[i] != i
+            return false
+        i = i + 1
+    true
+
+// The section entry with index `k`.
+fn section_value(found: [(Int, Bool, Str)], k: Int) -> (Bool, Str)
+    for s in found
+        if s.0 == k
+            return (s.1, s.2)
+    // cov: skip — the caller checks contiguity first, so every below the count is present
+    (false, "")
+
+// The character set and the text after a `charset'language'` prefix, or
+// `None` when the value carries no prefix.
+fn charset_prefix(value: Str) -> Result<?(MailCharset, Str), mailerror.MailError>
+    match str.index(value, "'")
+        None    => Ok(None)
+        Some(a) =>
+            match str.index_from(value, "'", a + 1)
+                None    => Ok(None)
+                Some(b) =>
+                    let name = str.slice(value, 0, a)
+                    let rest = str.slice(value, b + 1, str.len(value))
+                    match charset_named(name)
+                        Some(c) => Ok(Some((c, rest)))
+                        None    => Err(MailUnknownCharset(name))
+
+// Whether a parameter value needs no RFC 2231 treatment: printable
+// ASCII with nothing that would need quoting, short enough to fit.
+fn plain_parameter_fits(name: Str, value: Str) -> Bool
+    if str.len(name) + 2 + str.len(value) > 76
+        return false
+    let data = bytes.from_str(value)
+    if not printable_ascii(data)
+        return false
+    let n = bytes.len(data)
+    var i = 0
+    while i < n
+        let b = bytes.byte_at(data, i) ?? 0
+        if str.contains("()<>@,;:\\\"/[]?=", str.from_byte(b))
+            return false
+        i = i + 1
+    true
+
+// The octets of a `B` or `Q` encoded word's text, in the encoding
+// named.
+fn encoded_body(data: Bytes, encoding: MailWordEncoding) -> Str
+    if encoding == MailQEncoding
+        return encode_q_bytes(data)
+    encode_b_bytes(data)
+
+// One whole encoded word around octets.
+fn word_of(data: Bytes, charset: MailCharset, encoding: MailWordEncoding) -> Str
+    let name = charset_name(charset)
+    let enc = encoding_name(encoding)
+    let body = encoded_body(data, encoding)
+    "=?${name}?${enc}?${body}?="
+
+// How long a `Q` -encoded word spends on one octet.
+fn q_cost(b: Int) -> Int
+    if b == ' '
+        return 1
+    if b >= '!' and b <= '~' and b != '=' and b != '?' and b != '_'
+        return 1
+    3
+
+// Whether an octet continues a UTF-8 character rather than opening one.
+fn utf8_continuation(b: Int) -> Bool
+    b >= 128 and b < 192
+
+// Whether `Q` keeps most of the octets readable, which is the smaller
+// of the two encodings when it does.
+fn mostly_ascii(data: Bytes) -> Bool
+    let n = bytes.len(data)
+    var literal = 0
+    var i = 0
+    while i < n
+        if q_cost(bytes.byte_at(data, i) ?? 0) == 1
+            literal = literal + 1
+        i = i + 1
+    literal * 2 >= n
+
+// Octets cut into words that each stay inside the 75 octets RFC 2047
+// § 2 allows, with no multi-octet UTF-8 character split across two.
+fn encoded_words(data: Bytes, charset: MailCharset, encoding: MailWordEncoding) -> [Str]
+    let budget = 68 - str.len(charset_name(charset))
+    var words: [Str] = []
+    let n = bytes.len(data)
+    var start = 0
+    while start < n
+        var end = start
+        if encoding == MailQEncoding
+            var used = 0
+            while end < n
+                let cost = q_cost(bytes.byte_at(data, end) ?? 0)
+                if used + cost > budget
+                    break
+                used = used + cost
+                end = end + 1
+        else
+            end = start + budget / 4 * 3
+            if end > n
+                end = n
+        if end <= start
+            // cov: skip — a word's budget is 58 octets or more, so a slice is never empty
+            end = start + 1
+        if charset == MailUtf8
+            while end > start and end < n
+                if not utf8_continuation(bytes.byte_at(data, end) ?? 0)
+                    break
+                end = end - 1
+        list.push(words, word_of(bytes.slice(data, start, end), charset, encoding))
+        start = end
+    words
+
+// The octets of `data` appended to a byte list.
+fn gather_octets(var out: [Int], data: Bytes)
+    let n = bytes.len(data)
+    var i = 0
+    while i < n
+        list.push(out, bytes.byte_at(data, i) ?? 0)
+        i = i + 1
+
+// How much of a percent-encoded value fits in one section without
+// cutting an escape in half.
+fn chunk_len(text: Str, from: Int, most: Int) -> Int
+    let n = str.len(text)
+    var i = from
+    var used = 0
+    while i < n
+        var step = 1
+        if str.byte_at_or(text, i, 0) == '%' and i + 3 <= n
+            step = 3
+        if used + step > most
+            break
+        used = used + step
+        i = i + step
+    if i == from
+        // cov: skip — the one caller passes 40 with a non-empty text, so the first step fits
+        i = i + 1
+    i - from
+
+// ── The two encodings an encoded word may use, RFC 2047 § 4.
 //
 // ```novo
 // use mailword
@@ -98,7 +584,9 @@ pub struct MailEncodedWord
 //     println(mailword.encoding_name(MailBEncoding))     // B
 // ```
 pub fn encoding_name(e: MailWordEncoding) -> Str
-    todo("mail-nv.mailword.encoding_name")
+    match e
+        MailQEncoding => "Q"
+        MailBEncoding => "B"
 
 // The canonical lowercase name of a character set: `"us-ascii"`,
 // `"iso-8859-1"`, `"utf-8"`.
@@ -110,7 +598,10 @@ pub fn encoding_name(e: MailWordEncoding) -> Str
 //     println(mailword.charset_name(MailLatin1))         // iso-8859-1
 // ```
 pub fn charset_name(c: MailCharset) -> Str
-    todo("mail-nv.mailword.charset_name")
+    match c
+        MailUsAscii => "us-ascii"
+        MailLatin1  => "iso-8859-1"
+        MailUtf8    => "utf-8"
 
 // The character set a name denotes, or `None`.
 //
@@ -128,7 +619,14 @@ pub fn charset_name(c: MailCharset) -> Str
 //         None    => println("not converted here")
 // ```
 pub fn charset_named(name: Str) -> ?MailCharset
-    todo("mail-nv.mailword.charset_named")
+    let key = str.lower(str.trim(name))
+    if key == "us-ascii" or key == "ascii"
+        return Some(MailUsAscii)
+    if key == "iso-8859-1" or key == "iso_8859-1" or key == "latin1"
+        return Some(MailLatin1)
+    if key == "utf-8" or key == "utf8"
+        return Some(MailUtf8)
+    None
 
 // One encoded word taken apart, without decoding its text.
 //
@@ -145,7 +643,47 @@ pub fn charset_named(name: Str) -> ?MailCharset
 //         Err(e) => println(e.message())
 // ```
 pub fn parse_word(text: Str) -> Result<MailEncodedWord, mailerror.MailError>
-    todo("mail-nv.mailword.parse_word")
+    let n = str.len(text)
+    if n < 5
+        return Err(MailBadEncodedWord(0))
+    if str.byte_at_or(text, 0, 0) != '=' or str.byte_at_or(text, 1, 0) != '?'
+        return Err(MailBadEncodedWord(0))
+    if str.byte_at_or(text, n - 2, 0) != '?' or str.byte_at_or(text, n - 1, 0) != '='
+        return Err(MailBadEncodedWord(n - 2))
+    let c_opt = str.index_from(text, "?", 2)
+    if c_opt == None
+        // cov: skip — five octets and a trailing `?=` put a `?` at or after offset 2
+        return Err(MailBadEncodedWord(2))
+    let c_end = c_opt ?? 2
+    if c_end + 4 > n
+        return Err(MailBadEncodedWord(c_end))
+    let enc_byte = str.byte_at_or(text, c_end + 1, 0)
+    var enc = MailQEncoding
+    if enc_byte == 'B' or enc_byte == 'b'
+        enc = MailBEncoding
+    elif enc_byte != 'Q' and enc_byte != 'q'
+        return Err(MailBadEncodedWord(c_end + 1))
+    if str.byte_at_or(text, c_end + 2, 0) != '?'
+        return Err(MailBadEncodedWord(c_end + 2))
+    let field = str.slice(text, 2, c_end)
+    var set_name = field
+    var language = ""
+    match str.index(field, "*")
+        Some(star) =>
+            set_name = str.slice(field, 0, star)
+            language = str.slice(field, star + 1, str.len(field))
+        None       => ()
+    var charset = MailUsAscii
+    match charset_named(set_name)
+        Some(c) =>
+            charset = c
+        None    =>
+            return Err(MailUnknownCharset(set_name))
+    Ok(MailEncodedWord {
+        charset: charset,
+        language: language,
+        encoding: enc,
+        encoded_text: str.slice(text, c_end + 3, n - 2) })
 
 // A whole header value decoded: every encoded word in it replaced by
 // its text, and the whitespace between two ADJACENT encoded words
@@ -165,7 +703,7 @@ pub fn parse_word(text: Str) -> Result<MailEncodedWord, mailerror.MailError>
 //         Err(e) => println(e.message())
 // ```
 pub fn decode_text(value: Str) -> Result<Str, mailerror.MailError>
-    todo("mail-nv.mailword.decode_text")
+    decode_words(value, false)
 
 // A `phrase` decoded — a display name, where RFC 2047 § 5 allows an
 // encoded word only where an `atom` is allowed.
@@ -185,7 +723,7 @@ pub fn decode_text(value: Str) -> Result<Str, mailerror.MailError>
 //         Err(e) => println(e.message())
 // ```
 pub fn decode_phrase(value: Str) -> Result<Str, mailerror.MailError>
-    todo("mail-nv.mailword.decode_phrase")
+    decode_words(value, true)
 
 // Whether a string needs encoding at all: true when it holds an octet
 // outside printable US-ASCII, or a line longer than the header limit.
@@ -202,7 +740,14 @@ pub fn decode_phrase(value: Str) -> Result<Str, mailerror.MailError>
 //     println("${mailword.needs_encoding("plain ascii")}")   // false
 // ```
 pub fn needs_encoding(text: Str) -> Bool
-    todo("mail-nv.mailword.needs_encoding")
+    let n = str.len(text)
+    var i = 0
+    while i < n
+        let b = str.byte_at_or(text, i, 0)
+        if b < ' ' or b > '~'
+            return true
+        i = i + 1
+    longest_line(text) > 998
 
 // Text encoded as one or more encoded words, each at most the 75
 // octets RFC 2047 § 2 allows, joined by a space and a fold.
@@ -221,7 +766,13 @@ pub fn needs_encoding(text: Str) -> Bool
 //     println(mailword.encode_text("Caf\u{e9}", MailUtf8))
 // ```
 pub fn encode_text(text: Str, charset: MailCharset) -> Str
-    todo("mail-nv.mailword.encode_text")
+    if not needs_encoding(text)
+        return text
+    let data = charset_bytes(charset, text)
+    var encoding = MailQEncoding
+    if not mostly_ascii(data)
+        encoding = MailBEncoding
+    str.join(encoded_words(data, charset, encoding), "\r\n ")
 
 // Text encoded as a single word in the encoding the caller names.
 //
@@ -236,7 +787,7 @@ pub fn encode_text(text: Str, charset: MailCharset) -> Str
 //     println(mailword.encode_word("Ada", MailUtf8, MailQEncoding))
 // ```
 pub fn encode_word(text: Str, charset: MailCharset, encoding: MailWordEncoding) -> Str
-    todo("mail-nv.mailword.encode_word")
+    word_of(charset_bytes(charset, text), charset, encoding)
 
 // An RFC 2231 § 3 parameter value assembled from its sections.
 //
@@ -255,7 +806,48 @@ pub fn encode_word(text: Str, charset: MailCharset, encoding: MailWordEncoding) 
 //         Err(e) => println(e.message())
 // ```
 pub fn assemble_parameter(name: Str, sections: [(Str, Str)]) -> Result<Str, mailerror.MailError>
-    todo("mail-nv.mailword.assemble_parameter")
+    var found: [(Int, Bool, Str)] = []
+    var plain = false
+    var plain_value = ""
+    for pair in sections
+        match section_of(pair.0, name)
+            Some(t) =>
+                if t.0 < 0
+                    plain = true
+                    plain_value = pair.1
+                else
+                    list.push(found, (t.0, t.1, pair.1))
+            None    => ()
+    if list.len(found) == 0
+        if plain
+            return Ok(plain_value)
+        return Err(MailBadParameterContinuation(name, "no section carries this parameter"))
+    if plain
+        return Err(MailBadParameterContinuation(name, "the plain and numbered forms are both present"))
+    if not sections_are_contiguous(found)
+        return Err(MailBadParameterContinuation(name, "a section is missing or repeated"))
+    var octets: [Int] = []
+    var charset: ?MailCharset = None
+    for k in 0..list.len(found)
+        let entry = section_value(found, k)
+        var value = entry.1
+        if k == 0 and entry.0
+            match charset_prefix(value)
+                Ok(Some(t)) =>
+                    charset = Some(t.0)
+                    value = t.1
+                Ok(None)    => ()
+                Err(e)      =>
+                    return Err(e)
+        if entry.0
+            gather_octets(var octets, percent_bytes(value))
+        else
+            gather_octets(var octets, bytes.from_str(value))
+    let data = bytes.from_byte_list(octets)
+    let text = match charset
+        Some(c) => charset_text(c, data)
+        None    => bytes.to_str(data)
+    Ok(text)
 
 // A parameter value split into the RFC 2231 sections that carry it.
 //
@@ -271,4 +863,21 @@ pub fn assemble_parameter(name: Str, sections: [(Str, Str)]) -> Result<Str, mail
 //     println("${list.len(mailword.split_parameter("filename", "report.pdf", MailUsAscii))}")
 // ```
 pub fn split_parameter(name: Str, value: Str, charset: MailCharset) -> [(Str, Str)]
-    todo("mail-nv.mailword.split_parameter")
+    if plain_parameter_fits(name, value)
+        return [(name, value)]
+    let encoded = percent_encode(charset_bytes(charset, value))
+    let head = "${charset_name(charset)}''"
+    var out: [(Str, Str)] = []
+    var at = 0
+    var section = 0
+    while at < str.len(encoded)
+        let take = chunk_len(encoded, at, 40)
+        var piece = str.slice(encoded, at, at + take)
+        if section == 0
+            piece = "${head}${piece}"
+        list.push(out, ("${name}*${section}*", piece))
+        at = at + take
+        section = section + 1
+    if list.len(out) == 0
+        list.push(out, ("${name}*0*", head))
+    out

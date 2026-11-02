@@ -1,15 +1,10 @@
 [package]
 name        = "mail-nv"
-version     = "0.0.2"
+version     = "0.1.0"
 description = "RFC 5322 messages and MIME, both directions: a message parsed into typed headers — addresses, dates over calendar-nv, message identifiers, content types with their parameters — and a tree of parts whose bodies are spans into the caller's octets, and built back with correct folding, encoded words and transfer encodings.  No socket: smtp-nv sends what this writes and dkim-nv signs it."
 license     = "Apache-2.0"
 
-# An INTERFACE release: every `pub fn` body is a `todo()`, so the
-# signatures and the effect rows are published and nothing is
-# implemented.  `novo pkg publish` recognises the shape and requires
-# both the draft stability and the 0.0.x version; the first
-# implementation is the 0.1.0 published over it.
-stability   = "draft"
+stability   = "experimental"
 
 # `core`.  A message is a byte string with a grammar over it, and
 # nothing in that grammar needs the machine: this package opens no
@@ -34,7 +29,7 @@ category    = "networking"
 tags        = ["email", "mime", "rfc-5322", "rfc-2045", "rfc-2047", "message", "smtp", "attachment"]
 repository  = "https://github.com/novolang/mail-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.9.0"
+novo        = ">= 0.20.2"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.
@@ -51,4 +46,4 @@ novo        = ">= 0.9.0"
 # is left to a caller that knows what an instant means.  Declaring a
 # date type here instead would collide with calendar-nv's on the way
 # into any program that used both.  `core`, so the layer rule holds.
-calendar-nv = "^0.2.0"
+calendar-nv = "^0.2.1"

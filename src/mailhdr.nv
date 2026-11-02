@@ -41,6 +41,245 @@ use civil
 use mailaddr
 use mailerror
 
+// ── Private helpers ──────────────────────────────────────────────────
+
+// Whether an octet is a decimal digit.
+fn digit_byte(b: Int) -> Bool
+    b >= '0' and b <= '9'
+
+// Whether an octet is an ASCII letter.
+fn alpha_byte(b: Int) -> Bool
+    if b >= 'A' and b <= 'Z'
+        return true
+    b >= 'a' and b <= 'z'
+
+// `n` as two digits, which is how RFC 5322 § 3.3 writes a day, an hour
+// or an offset component.
+fn pad2(n: Int) -> Str
+    if n < 10
+        return "0${n}"
+    "${n}"
+
+// The text with leading spaces and tabs removed.
+fn ltrim_ws(text: Str) -> Str
+    var i = 0
+    while i < str.len(text)
+        let b = str.byte_at_or(text, i, 0)
+        if b != ' ' and b != '\t'
+            break
+        i = i + 1
+    str.slice(text, i, str.len(text))
+
+// The offset of the first CR or LF at or after `from`, or the end.
+fn line_end(source: Bytes, from: Int) -> Int
+    let n = bytes.len(source)
+    var i = from
+    while i < n
+        let b = bytes.byte_at(source, i) ?? 0
+        if b == '\r' or b == '\n'
+            break
+        i = i + 1
+    i
+
+// The offset just past the line break at `from`.
+fn skip_break(source: Bytes, from: Int) -> Int
+    let n = bytes.len(source)
+    if from >= n
+        return from
+    let b = bytes.byte_at(source, from) ?? 0
+    if b == '\r' and from + 1 < n and (bytes.byte_at(source, from + 1) ?? 0) == 10
+        return from + 2
+    if b == '\r' or b == '\n'
+        return from + 1
+    // cov: skip — every caller passes a line break or the end of the source
+    from
+
+// The offset of octet `want` in `[from, to)`, or `-1`.
+fn find_byte(source: Bytes, want: Int, from: Int, to: Int) -> Int
+    var i = from
+    while i < to
+        if (bytes.byte_at(source, i) ?? 0) == want
+            return i
+        i = i + 1
+    -1
+
+// The text with every parenthesised comment removed.  A date field is
+// allowed to carry them between its components (RFC 5322 § 3.3 with
+// § 3.2.2), and one that stopped the parse would lose a date every
+// receiver accepts.
+fn strip_comments(text: Str) -> Str
+    var out: [Str] = []
+    let n = str.len(text)
+    var i = 0
+    while i < n
+        let b = str.byte_at_or(text, i, 0)
+        if b == '('
+            var depth = 1
+            i = i + 1
+            while i < n and depth > 0
+                let c = str.byte_at_or(text, i, 0)
+                if c == '\\'
+                    i = i + 2
+                else
+                    if c == '('
+                        depth = depth + 1
+                    elif c == ')'
+                        depth = depth - 1
+                    i = i + 1
+        else
+            list.push(out, str.slice(text, i, i + 1))
+            i = i + 1
+    str.join(out, "")
+
+// The offset just past whitespace and the separators `,` and `:`.
+fn skip_sep(s: Str, from: Int) -> Int
+    var i = from
+    while i < str.len(s)
+        let b = str.byte_at_or(s, i, 0)
+        if b == ' ' or b == '\t' or b == ',' or b == ':'
+            i = i + 1
+        else
+            break
+    i
+
+// What a token of a date is.
+enum DateTokenKind
+    DateTokenEnd
+    DateTokenWord
+    DateTokenNumber
+    DateTokenOffset
+
+// The next token of a date: `(DateTokenEnd, _, "")` at the end,
+// `(DateTokenWord, _, word)` for letters, `(DateTokenNumber, _, digits)`
+// for a number and `(DateTokenOffset, _, "+HHMM")` for a signed offset.
+// A `+` or `-` with four digits after it is the sign of
+// an offset; anywhere else it is a separator, which is what reads the
+// dashed `21-Nov-97` the archives are full of.
+fn next_token(s: Str, from: Int) -> (DateTokenKind, Int, Str)
+    let n = str.len(s)
+    var i = skip_sep(s, from)
+    while i < n
+        let b = str.byte_at_or(s, i, 0)
+        match b
+            43 | 45            =>
+                var k = i + 1
+                while k < n and digit_byte(str.byte_at_or(s, k, 0))
+                    k = k + 1
+                if k == i + 5
+                    return (DateTokenOffset, k, str.slice(s, i, k))
+                i = i + 1
+            _ if digit_byte(b) =>
+                var k = i
+                while k < n and digit_byte(str.byte_at_or(s, k, 0))
+                    k = k + 1
+                return (DateTokenNumber, k, str.slice(s, i, k))
+            _ if alpha_byte(b) =>
+                var k = i
+                while k < n and alpha_byte(str.byte_at_or(s, k, 0))
+                    k = k + 1
+                return (DateTokenWord, k, str.slice(s, i, k))
+            _                  =>
+                i = i + 1
+    (DateTokenEnd, n, "")
+
+// The number a token spells.
+fn token_int(text: Str) -> Int
+    str.to_int(text) ?? 0
+
+// The month a name denotes, or `0`.
+fn month_number(name: Str) -> Int
+    let k = str.lower(name)
+    let names = ["jan", "feb", "mar", "apr", "may", "jun",
+                 "jul", "aug", "sep", "oct", "nov", "dec"]
+    var i = 0
+    while i < list.len(names)
+        if names[i] == k
+            return i + 1
+        i = i + 1
+    0
+
+// The name a month is written with.
+fn month_name(n: Int) -> Str
+    let names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    if n < 1 or n > 12
+        // cov: skip — a month that reaches here came from a parsed date or a civil date
+        return "Jan"
+    names[n - 1]
+
+// The zone an obsolete alphabetic name denotes, in minutes east of
+// UTC, or `-100000` for one this package does not know.  RFC 5322
+// § 4.3 lists the names and leaves `J` out of the military series.
+fn zone_offset(name: Str) -> Int
+    let k = str.lower(name)
+    if k == "ut" or k == "gmt" or k == "z"
+        return 0
+    if k == "est"
+        return -300
+    if k == "edt"
+        return -240
+    if k == "cst"
+        return -360
+    if k == "cdt"
+        return -300
+    if k == "mst"
+        return -420
+    if k == "mdt"
+        return -360
+    if k == "pst"
+        return -480
+    if k == "pdt"
+        return -420
+    if str.len(k) == 1
+        let b = str.byte_at_or(k, 0, 0)
+        if b >= 'a' and b <= 'i'
+            return (b - 96) * 60
+        if b >= 'k' and b <= 'm'
+            // `J` is the one letter missing from the series, so `K` is
+            // the tenth hour and not the eleventh: past `I` the letter
+            // and the hour stop agreeing.
+            return (b - 97) * 60
+        if b >= 'n' and b <= 'y'
+            return 0 - (b - 109) * 60
+    -100000
+
+// Whether an octet is the whitespace a fold may be inserted before:
+// RFC 5322 § 2.2.3's `WSP`, a space or a tab.
+fn ws_byte(b: Int) -> Bool
+    b == ' ' or b == '\t'
+
+// The field body written on lines of at most `limit` octets, the fold
+// replacing one whitespace octet at a time so that unfolding gives the
+// body back exactly.
+fn folded(name: Str, value: Str, limit: Int) -> Str
+    var out: [Str] = []
+    var used = str.len(name) + 2
+    let n = str.len(value)
+    var i = 0
+    var in_quotes = false
+    while i < n
+        let b = str.byte_at_or(value, i, 0)
+        match b
+            34                                         =>
+                in_quotes = not in_quotes
+                list.push(out, str.slice(value, i, i + 1))
+                used = used + 1
+                i = i + 1
+            _ if in_quotes and b == '\\' and i + 1 < n =>
+                list.push(out, str.slice(value, i, i + 2))
+                used = used + 2
+                i = i + 2
+            32 | 9 if not in_quotes and used >= limit  =>
+                list.push(out, "\r\n")
+                list.push(out, str.slice(value, i, i + 1))
+                used = 1
+                i = i + 1
+            _                                          =>
+                list.push(out, str.slice(value, i, i + 1))
+                used = used + 1
+                i = i + 1
+    "${name}: ${str.join(out, "")}"
+
 // One header field, as it was written.
 //
 // ```novo
@@ -132,7 +371,7 @@ pub struct MailMessageId
 //     println(mailhdr.field("To", "ada@example.com").value)
 // ```
 pub fn field(name: Str, value: Str) -> MailField
-    todo("mail-nv.mailhdr.field")
+    MailField { name: name, value: value, offset: -1 }
 
 // A header section from a list of fields.
 //
@@ -143,7 +382,7 @@ pub fn field(name: Str, value: Str) -> MailField
 //     println("${list.len(mailhdr.headers([]).fields)}")     // 0
 // ```
 pub fn headers(fields: [MailField]) -> MailHeaders
-    todo("mail-nv.mailhdr.headers")
+    MailHeaders { fields: fields }
 
 // The header section parsed from the bytes of a message or a part.
 //
@@ -162,7 +401,47 @@ pub fn headers(fields: [MailField]) -> MailHeaders
 // ```
 pub fn parse_headers(source: Bytes,
                      from_offset: Int) -> Result<MailParsedHeaders, mailerror.MailError>
-    todo("mail-nv.mailhdr.parse_headers")
+    var fields: [MailField] = []
+    let n = bytes.len(source)
+    var at = from_offset
+    var done = false
+    var body_at = n
+    while not done and at < n
+        let eol = line_end(source, at)
+        if eol == at
+            done = true
+            body_at = skip_break(source, at)
+        else
+            let colon = find_byte(source, 58, at, eol)
+            if colon <= at
+                return Err(MailHeaderMalformed(at))
+            var k = at
+            while k < colon
+                let b = bytes.byte_at(source, k) ?? 0
+                if b < '!' or b > '~' or b == ':'
+                    return Err(MailBadFieldName(k))
+                k = k + 1
+            let name = bytes.to_str(bytes.slice(source, at, colon))
+            var val_end = eol
+            var next = skip_break(source, eol)
+            while next < n
+                let b = bytes.byte_at(source, next) ?? 0
+                if b != ' ' and b != '\t'
+                    break
+                let ce = line_end(source, next)
+                val_end = ce
+                next = skip_break(source, ce)
+            let raw = bytes.to_str(bytes.slice(source, colon + 1, val_end))
+            list.push(fields, MailField {
+                name: name,
+                value: unfold(ltrim_ws(raw)),
+                offset: at })
+            at = next
+    if not done
+        return Err(MailHeadersUnterminated(at))
+    Ok(MailParsedHeaders {
+        headers: MailHeaders { fields: fields },
+        body_offset: body_at })
 
 // The header section and where the body starts after it.
 //
@@ -195,7 +474,11 @@ pub struct MailParsedHeaders
 //     println(mailhdr.value_of(h, "SUBJECT"))               // Hi
 // ```
 pub fn value_of(h: MailHeaders, name: Str) -> Str
-    todo("mail-nv.mailhdr.value_of")
+    let key = str.lower(name)
+    for f in h.fields
+        if str.lower(f.name) == key
+            return f.value
+    ""
 
 // Every field with this name, in order.
 //
@@ -210,7 +493,12 @@ pub fn value_of(h: MailHeaders, name: Str) -> Str
 //     println("${list.len(mailhdr.values_of(h, "received"))}")   // 2
 // ```
 pub fn values_of(h: MailHeaders, name: Str) -> [Str]
-    todo("mail-nv.mailhdr.values_of")
+    let key = str.lower(name)
+    var out: [Str] = []
+    for f in h.fields
+        if str.lower(f.name) == key
+            list.push(out, f.value)
+    out
 
 // How many fields carry this name.
 //
@@ -228,7 +516,12 @@ pub fn values_of(h: MailHeaders, name: Str) -> [Str]
 //     println("${mailhdr.field_count(h, "from")}")          // 1
 // ```
 pub fn field_count(h: MailHeaders, name: Str) -> Int
-    todo("mail-nv.mailhdr.field_count")
+    let key = str.lower(name)
+    var n = 0
+    for f in h.fields
+        if str.lower(f.name) == key
+            n = n + 1
+    n
 
 // The header section with a field appended at the end.
 //
@@ -240,7 +533,11 @@ pub fn field_count(h: MailHeaders, name: Str) -> Int
 //     println("${list.len(h.fields)}")                      // 1
 // ```
 pub fn append(h: MailHeaders, f: MailField) -> MailHeaders
-    todo("mail-nv.mailhdr.append")
+    var out: [MailField] = []
+    for e in h.fields
+        list.push(out, e)
+    list.push(out, f)
+    MailHeaders { fields: out }
 
 // The header section with a field prepended at the front.
 //
@@ -256,7 +553,10 @@ pub fn append(h: MailHeaders, f: MailField) -> MailHeaders
 //     println(h.fields[0].name)                             // Received
 // ```
 pub fn prepend(h: MailHeaders, f: MailField) -> MailHeaders
-    todo("mail-nv.mailhdr.prepend")
+    var out: [MailField] = [f]
+    for e in h.fields
+        list.push(out, e)
+    MailHeaders { fields: out }
 
 // The header section with every field of this name removed.
 //
@@ -268,7 +568,12 @@ pub fn prepend(h: MailHeaders, f: MailField) -> MailHeaders
 //     println("${list.len(h.fields)}")                      // 0
 // ```
 pub fn without(h: MailHeaders, name: Str) -> MailHeaders
-    todo("mail-nv.mailhdr.without")
+    let want = str.lower(name)
+    var out: [MailField] = []
+    for f in h.fields
+        if str.lower(f.name) != want
+            list.push(out, f)
+    MailHeaders { fields: out }
 
 // A field body with its folding whitespace removed: every CRLF that is
 // followed by a space or a tab is deleted, and nothing else changes.
@@ -283,7 +588,24 @@ pub fn without(h: MailHeaders, name: Str) -> MailHeaders
 //     println(mailhdr.unfold("Hello\r\n world"))            // Hello world
 // ```
 pub fn unfold(value: Str) -> Str
-    todo("mail-nv.mailhdr.unfold")
+    var out: [Str] = []
+    let n = str.len(value)
+    var i = 0
+    while i < n
+        let b = str.byte_at_or(value, i, 0)
+        match b
+            13 if i + 1 < n and str.byte_at_or(value, i + 1, 0) == '\n'       =>
+                if i + 2 < n and ws_byte(str.byte_at_or(value, i + 2, 0))
+                    i = i + 2
+                else
+                    list.push(out, "\r\n")
+                    i = i + 2
+            13 | 10 if i + 1 < n and ws_byte(str.byte_at_or(value, i + 1, 0)) =>
+                i = i + 1
+            _                                                                 =>
+                list.push(out, str.slice(value, i, i + 1))
+                i = i + 1
+    str.join(out, "")
 
 // A field body folded to fit the 78 octet line RFC 2822 § 2.1.1
 // recommends, breaking only at whitespace outside a quoted string.
@@ -301,7 +623,7 @@ pub fn unfold(value: Str) -> Str
 //     println(mailhdr.fold("Subject", "a short one", 78))
 // ```
 pub fn fold(name: Str, value: Str, limit: Int) -> Str
-    todo("mail-nv.mailhdr.fold")
+    folded(name, value, limit)
 
 // The whole header section written back, each field folded, with the
 // terminating empty line.
@@ -313,7 +635,10 @@ pub fn fold(name: Str, value: Str, limit: Int) -> Str
 //     println(mailhdr.format_headers(mailhdr.headers([mailhdr.field("Subject", "Hi")])))
 // ```
 pub fn format_headers(h: MailHeaders) -> Str
-    todo("mail-nv.mailhdr.format_headers")
+    var out: [Str] = []
+    for f in h.fields
+        list.push(out, folded(f.name, f.value, 78))
+    "${str.join(out, "\r\n")}\r\n\r\n"
 
 // A date and time with an offset in minutes east of UTC.
 //
@@ -326,7 +651,7 @@ pub fn format_headers(h: MailHeaders) -> Str
 //     println("${mailhdr.datetime(dt, 0).offset_known}")    // true
 // ```
 pub fn datetime(local: civil.CivilDateTime, offset_minutes: Int) -> MailDateTime
-    todo("mail-nv.mailhdr.datetime")
+    MailDateTime { local: local, offset_minutes: offset_minutes, offset_known: true }
 
 // A `Date:` field body parsed, RFC 5322 § 3.3.
 //
@@ -344,7 +669,96 @@ pub fn datetime(local: civil.CivilDateTime, offset_minutes: Int) -> MailDateTime
 //         Err(e) => println(e.message())
 // ```
 pub fn parse_date(value: Str) -> Result<MailDateTime, mailerror.MailError>
-    todo("mail-nv.mailhdr.parse_date")
+    let s = str.trim(strip_comments(value))
+    var at = 0
+    var day = -1
+    var month = 0
+    var year = -100000
+    var hour = 0
+    var minute = 0
+    var second = 0
+    var offset = -100000
+    var known = true
+    // Which component the next bare number is: the date comes first in
+    // every form, so the same counter reads `21 Nov 1997` and `21 11
+    // 1997` without a second pass.
+    var stage = 0
+    var done = false
+    while not done
+        let t = next_token(s, at)
+        if t.0 == DateTokenEnd
+            done = true
+        else
+            at = t.1
+            match t.0
+                DateTokenOffset =>
+                    let negative = str.byte_at_or(t.2, 0, 0) == '-'
+                    let digits = str.slice(t.2, 1, 5)
+                    let mins = token_int(str.slice(digits, 0, 2)) * 60 + token_int(str.slice(digits, 2, 4))
+                    if negative
+                        offset = 0 - mins
+                        if mins == 0
+                            known = false
+                    else
+                        offset = mins
+                    stage = 6
+                DateTokenWord   =>
+                    let mn = month_number(t.2)
+                    if mn > 0 and stage <= 1
+                        month = mn
+                        stage = 2
+                    else
+                        let z = zone_offset(t.2)
+                        if z != -100000
+                            offset = z
+                            stage = 6
+                DateTokenNumber =>
+                    match stage
+                        0 =>
+                            day = token_int(t.2)
+                            stage = 1
+                        1 =>
+                            month = token_int(t.2)
+                            stage = 2
+                        2 =>
+                            year = token_int(t.2)
+                            stage = 3
+                        3 =>
+                            hour = token_int(t.2)
+                            stage = 4
+                        4 =>
+                            minute = token_int(t.2)
+                            stage = 5
+                        5 =>
+                            second = token_int(t.2)
+                            stage = 6
+                        _ =>
+                            return Err(MailBadDate(0))
+                // cov: skip — the branch above has already left on DateTokenEnd, so this arm only makes the match exhaustive
+                DateTokenEnd    => ()
+    if day < 0 or month < 1 or month > 12 or year == -100000 or offset == -100000
+        return Err(MailBadDate(0))
+    var full_year = year
+    if year < 100
+        // RFC 5322 § 4.3: a two-digit year is in the last century
+        // unless that would put it in the future, which is the reading
+        // every archived message expects.
+        if year < 50
+            full_year = 2000 + year
+        else
+            full_year = 1900 + year
+    let d = match civil.date(full_year, month, day)
+        Ok(v)  => v
+        Err(_) =>
+            return Err(MailBadDate(0))
+    let tm = match civil.time_of(hour, minute, second, 0)
+        Ok(v)  => v
+        Err(_) =>
+            return Err(MailBadDate(0))
+    Ok(MailDateTime {
+        local: civil.datetime(d, tm),
+        offset_minutes: offset,
+        offset_known: known })
 
 // A `Date:` field body written, in the one form RFC 5322 § 3.3
 // specifies: `Fri, 21 Nov 1997 09:55:06 -0600`.
@@ -362,7 +776,19 @@ pub fn parse_date(value: Str) -> Result<MailDateTime, mailerror.MailError>
 //     println(mailhdr.format_date(mailhdr.datetime(dt, -360)))
 // ```
 pub fn format_date(d: MailDateTime) -> Str
-    todo("mail-nv.mailhdr.format_date")
+    let names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    let w = civil.weekday_number(civil.weekday(d.local.date))
+    var day_name = "Mon"
+    if w >= 1 and w <= 7
+        day_name = names[w - 1]
+    var sign = "+"
+    var magnitude = d.offset_minutes
+    if not d.offset_known
+        return "${day_name}, ${pad2(d.local.date.day)} ${month_name(d.local.date.month)} ${d.local.date.year} ${pad2(d.local.time.hour)}:${pad2(d.local.time.minute)}:${pad2(d.local.time.second)} -0000"
+    if magnitude < 0
+        sign = "-"
+        magnitude = 0 - magnitude
+    "${day_name}, ${pad2(d.local.date.day)} ${month_name(d.local.date.month)} ${d.local.date.year} ${pad2(d.local.time.hour)}:${pad2(d.local.time.minute)}:${pad2(d.local.time.second)} ${sign}${pad2(magnitude / 60)}${pad2(magnitude % 60)}"
 
 // A message identifier from its two halves.
 //
@@ -373,7 +799,7 @@ pub fn format_date(d: MailDateTime) -> Str
 //     println(mailhdr.message_id("abc", "example.com").id_right)
 // ```
 pub fn message_id(id_left: Str, id_right: Str) -> MailMessageId
-    todo("mail-nv.mailhdr.message_id")
+    MailMessageId { id_left: id_left, id_right: id_right }
 
 // A `Message-ID:` field body parsed: one `msg-id` in angle brackets.
 //
@@ -386,7 +812,20 @@ pub fn message_id(id_left: Str, id_right: Str) -> MailMessageId
 //         Err(e) => println(e.message())
 // ```
 pub fn parse_message_id(value: Str) -> Result<MailMessageId, mailerror.MailError>
-    todo("mail-nv.mailhdr.parse_message_id")
+    let s = str.trim(value)
+    let n = str.len(s)
+    if n < 5
+        return Err(MailBadMessageId(0))
+    if str.byte_at_or(s, 0, 0) != '<' or str.byte_at_or(s, n - 1, 0) != '>'
+        return Err(MailBadMessageId(0))
+    let inner = str.slice(s, 1, n - 1)
+    let at = str.index(inner, "@")
+    if let Some(i) = at
+        if i > 0 and i + 1 < str.len(inner) and not str.contains(inner, " ")
+            return Ok(MailMessageId {
+                id_left: str.slice(inner, 0, i),
+                id_right: str.slice(inner, i + 1, str.len(inner)) })
+    Err(MailBadMessageId(0))
 
 // A `References:` or `In-Reply-To:` field body parsed: a sequence of
 // `msg-id`, in order.
@@ -404,7 +843,24 @@ pub fn parse_message_id(value: Str) -> Result<MailMessageId, mailerror.MailError
 //         Err(e) => println(e.message())
 // ```
 pub fn parse_message_ids(value: Str) -> Result<[MailMessageId], mailerror.MailError>
-    todo("mail-nv.mailhdr.parse_message_ids")
+    let s = str.trim(value)
+    let n = str.len(s)
+    var out: [MailMessageId] = []
+    var i = 0
+    while i < n
+        let b = str.byte_at_or(s, i, 0)
+        if b == '<'
+            let close = str.index_from(s, ">", i + 1)
+            match close
+                Some(j) =>
+                    let m = parse_message_id(str.slice(s, i, j + 1))!
+                    list.push(out, m)
+                    i = j + 1
+                None    =>
+                    return Err(MailBadMessageId(i))
+        else
+            i = i + 1
+    Ok(out)
 
 // A message identifier written back, brackets included.
 //
@@ -415,7 +871,7 @@ pub fn parse_message_ids(value: Str) -> Result<[MailMessageId], mailerror.MailEr
 //     println(mailhdr.format_message_id(mailhdr.message_id("abc", "example.com")))
 // ```
 pub fn format_message_id(m: MailMessageId) -> Str
-    todo("mail-nv.mailhdr.format_message_id")
+    "<${m.id_left}@${m.id_right}>"
 
 // The addresses in a named field, parsed.
 //
@@ -434,4 +890,8 @@ pub fn format_message_id(m: MailMessageId) -> Str
 //         Err(e) => println(e.message())
 // ```
 pub fn addresses_of(h: MailHeaders, name: Str) -> Result<[mailaddr.MailEntry], mailerror.MailError>
-    todo("mail-nv.mailhdr.addresses_of")
+    var empty: [mailaddr.MailEntry] = []
+    let found = values_of(h, name)
+    if list.len(found) == 0
+        return Ok(empty)
+    mailaddr.parse_entries(found[0])

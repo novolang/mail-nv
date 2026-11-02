@@ -1,0 +1,1174 @@
+// mail_nv_gap_tests.nv — the branches the interface suites and the
+// four rule pins do not reach: every arm of a refusal, the codecs'
+// accepted spellings and their refusals, the error path of each
+// parser, and the writer's long-value and non-ASCII paths.
+//
+// Nothing here is a new claim about the design.  Each case is a
+// sentence from a doc comment that the other suites never exercised.
+
+use std.test
+use mailaddr
+use mailctype
+use mailerror
+use mailhdr
+use mailmime
+use mailmsg
+use mailword
+use mailxfer
+
+fn reason_list() -> [MailError]
+    [MailHeaderMalformed(1),
+     MailBadFieldName(2),
+     MailHeadersUnterminated(3),
+     MailBadAddress(4, "the local part is empty"),
+     MailBadDate(5),
+     MailBadMessageId(6),
+     MailBadContentType(7, "the subtype is missing"),
+     MailMissingBoundary(8),
+     MailBoundaryUnterminated(9),
+     MailUnknownTransferEncoding("x-uuencode"),
+     MailBadQuotedPrintable(11),
+     MailBadBase64(12),
+     MailBadEncodedWord(13),
+     MailUnknownCharset("x-mac-ce"),
+     MailBadParameterContinuation("filename", "two of section 0"),
+     MailLineTooLong(16),
+     MailTooDeep(17),
+     MailSpanOutOfRange(18, 4)]
+
+// ── mailerror: every reason answers every question ───────────────────
+
+@test
+fn test_every_reason_answers_a_code_and_a_message() [io]
+    let reasons = reason_list()
+    test.assert_eq(list.len(reasons), 18)
+    var codes: [Str] = []
+    for e in reasons
+        test.assert(str.len(e.message()) > 0)
+        list.push(codes, mailerror.code(e))
+    test.assert_eq(list.len(codes), 18)
+
+    test.case("and no two reasons share a code")
+    var distinct = 0
+    for i in 0..list.len(codes)
+        var seen = false
+        for j in 0..i
+            if codes[j] == codes[i]
+                seen = true
+        if not seen
+            distinct = distinct + 1
+    test.assert_eq(distinct, 18)
+
+@test
+fn test_every_reason_names_the_octet_it_stopped_at() [io]
+    test.assert_eq(mailerror.offset_of(MailHeaderMalformed(1)), 1)
+    test.assert_eq(mailerror.offset_of(MailBadFieldName(2)), 2)
+    test.assert_eq(mailerror.offset_of(MailHeadersUnterminated(3)), 3)
+    test.assert_eq(mailerror.offset_of(MailBadAddress(4, "why")), 4)
+    test.assert_eq(mailerror.offset_of(MailBadDate(5)), 5)
+    test.assert_eq(mailerror.offset_of(MailBadMessageId(6)), 6)
+    test.assert_eq(mailerror.offset_of(MailBadContentType(7, "why")), 7)
+    test.assert_eq(mailerror.offset_of(MailMissingBoundary(8)), 8)
+    test.assert_eq(mailerror.offset_of(MailBoundaryUnterminated(9)), 9)
+    test.assert_eq(mailerror.offset_of(MailBadQuotedPrintable(11)), 11)
+    test.assert_eq(mailerror.offset_of(MailBadBase64(12)), 12)
+    test.assert_eq(mailerror.offset_of(MailBadEncodedWord(13)), 13)
+    test.assert_eq(mailerror.offset_of(MailLineTooLong(16)), 16)
+    test.assert_eq(mailerror.offset_of(MailSpanOutOfRange(18, 4)), 18)
+
+    test.case("and the reasons that name a string name no octet")
+    test.assert_eq(mailerror.offset_of(MailUnknownTransferEncoding("x")), -1)
+    test.assert_eq(mailerror.offset_of(MailUnknownCharset("x")), -1)
+    test.assert_eq(mailerror.offset_of(MailBadParameterContinuation("a", "b")), -1)
+    test.assert_eq(mailerror.offset_of(MailTooDeep(4)), -1)
+
+    test.case("only an intact message that cannot be shown is unrenderable")
+    test.assert_false(mailerror.is_unrenderable(MailBadBase64(1)),
+                      "a corrupt body is not a rendering limit")
+    test.assert(mailerror.is_unrenderable(MailUnknownTransferEncoding("x-uuencode")))
+    test.assert(mailerror.is_truncated(MailHeadersUnterminated(3)))
+    test.assert_false(mailerror.is_truncated(MailTooDeep(4)), "too deep is not truncated")
+
+@test
+fn test_every_reason_answers_a_stable_code() [io]
+    test.assert_eq_str(mailerror.code(MailHeaderMalformed(0)), "header-malformed")
+    test.assert_eq_str(mailerror.code(MailBadFieldName(0)), "bad-field-name")
+    test.assert_eq_str(mailerror.code(MailHeadersUnterminated(0)), "headers-unterminated")
+    test.assert_eq_str(mailerror.code(MailBadAddress(0, "why")), "bad-address")
+    test.assert_eq_str(mailerror.code(MailBadDate(0)), "bad-date")
+    test.assert_eq_str(mailerror.code(MailBadMessageId(0)), "bad-message-id")
+    test.assert_eq_str(mailerror.code(MailBadContentType(0, "why")), "bad-content-type")
+    test.assert_eq_str(mailerror.code(MailMissingBoundary(0)), "missing-boundary")
+    test.assert_eq_str(mailerror.code(MailBoundaryUnterminated(0)), "boundary-unterminated")
+    test.assert_eq_str(mailerror.code(MailUnknownTransferEncoding("x")), "unknown-transfer-encoding")
+    test.assert_eq_str(mailerror.code(MailBadQuotedPrintable(0)), "bad-quoted-printable")
+    test.assert_eq_str(mailerror.code(MailBadBase64(0)), "bad-base64")
+    test.assert_eq_str(mailerror.code(MailBadEncodedWord(0)), "bad-encoded-word")
+    test.assert_eq_str(mailerror.code(MailUnknownCharset("x")), "unknown-charset")
+    test.assert_eq_str(mailerror.code(MailBadParameterContinuation("a", "b")),
+                       "bad-parameter-continuation")
+    test.assert_eq_str(mailerror.code(MailLineTooLong(0)), "line-too-long")
+    test.assert_eq_str(mailerror.code(MailTooDeep(1)), "too-deep")
+    test.assert_eq_str(mailerror.code(MailSpanOutOfRange(0, 1)), "span-out-of-range")
+
+// ── mailxfer: the spellings the codecs accept ────────────────────────
+
+@test
+fn test_quoted_printable_reads_every_escape_it_accepts() [io]
+    let upper = bytes.from_str("a=3Db")
+    match mailxfer.decode_quoted_printable(upper, mailxfer.span(0, 5))
+        Ok(b)  => test.assert_eq_str(bytes.to_str(b), "a=b")
+        Err(e) => test.fail(e.message())
+
+    test.case("a lowercase hexadecimal digit is accepted on the way in")
+    let lower = bytes.from_str("=c3=a9")
+    match mailxfer.decode_quoted_printable(lower, mailxfer.span(0, 6))
+        Ok(b)  => test.assert_eq(bytes.len(b), 2)
+        Err(e) => test.fail(e.message())
+
+    test.case("a soft line break is removed in all three spellings")
+    for soft in ["a=\r\nb", "a=\nb", "a=\rb"]
+        match mailxfer.decode_quoted_printable(bytes.from_str(soft), mailxfer.span(0, str.len(soft)))
+            Ok(b)  => test.assert_eq_str(bytes.to_str(b), "ab")
+            Err(e) => test.fail(e.message())
+
+    test.case("half an escape is a refusal, not a literal")
+    let half = bytes.from_str("=AZ")
+    match mailxfer.decode_quoted_printable(half, mailxfer.span(0, 3))
+        Ok(b)  => test.fail("an escape with a non-hex digit decoded")
+        Err(e) => test.assert_eq(mailerror.offset_of(e), 0)
+
+    test.case("and so is a span that reaches past its source")
+    match mailxfer.decode_quoted_printable(half, mailxfer.span(0, 99))
+        Ok(b)  => test.fail("an out-of-range span decoded")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "span-out-of-range")
+
+@test
+fn test_quoted_printable_writes_the_escapes_it_must() [io]
+    test.case("a trailing space is encoded, so a mail path cannot strip it")
+    let spaced = mailxfer.encode_quoted_printable(bytes.from_str("hi "))
+    test.assert(str.ends_with(spaced, "=20"))
+
+    test.case("a line that is not CRLF still ends a line")
+    let lf = mailxfer.encode_quoted_printable(bytes.from_str("a\nb"))
+    test.assert(str.contains(lf, "a\nb"))
+
+    test.case("a long run of printable ASCII gets a soft line break")
+    var run: [Str] = []
+    var i = 0
+    while i < 100
+        list.push(run, "a")
+        i = i + 1
+    let encoded = mailxfer.encode_quoted_printable(bytes.from_str(str.join(run, "")))
+    test.assert_true(str.contains(encoded, "=\r\n"), "a soft line break is inserted")
+    match mailxfer.decode_quoted_printable(bytes.from_str(encoded), mailxfer.span(0, str.len(encoded)))
+        Ok(b)  => test.assert_eq(bytes.len(b), 100)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_base64_reads_and_writes_every_octet_a_line_carries() [io]
+    let digit = bytes.from_str("MQ==")
+    match mailxfer.decode_base64(digit, mailxfer.span(0, 4))
+        Ok(b)  => test.assert_eq_str(bytes.to_str(b), "1")
+        Err(e) => test.fail(e.message())
+
+    test.case("a padding that is not at the end is a refusal")
+    let bad = bytes.from_str("a")
+    match mailxfer.decode_base64(bad, mailxfer.span(0, 1))
+        Ok(b)  => test.fail("a one-character group decoded")
+        Err(e) => test.assert_eq(mailerror.offset_of(e), 0)
+
+    test.case("and so is a span that reaches past its source")
+    match mailxfer.decode_base64(digit, mailxfer.span(2, 99))
+        Ok(b)  => test.fail("an out-of-range span decoded")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "span-out-of-range")
+
+    test.case("the dispatcher chooses the decoder the encoding names")
+    let src = bytes.from_str("aGk=")
+    match mailxfer.decode(src, mailxfer.span(0, 4), MailBase64Encoding)
+        Ok(b)  => test.assert_eq_str(bytes.to_str(b), "hi")
+        Err(e) => test.fail(e.message())
+    match mailxfer.decode(src, mailxfer.span(0, 4), MailSevenBit)
+        Ok(b)  => test.assert_eq(bytes.len(b), 4)
+        Err(e) => test.fail(e.message())
+
+    test.case("and the writer wraps a long body at 76 octets")
+    var many: [Str] = []
+    var i = 0
+    while i < 120
+        list.push(many, "a")
+        i = i + 1
+    let wrapped = mailxfer.encode_base64(bytes.from_str(str.join(many, "")))
+    test.assert_true(str.contains(wrapped, "\r\n"), "a long body is wrapped")
+
+@test
+fn test_choose_encoding_reads_a_line_that_is_too_long() [io]
+    var pieces: [Str] = []
+    var i = 0
+    while i < 1000
+        list.push(pieces, "a")
+        i = i + 1
+    let one_line = bytes.from_str(str.join(pieces, ""))
+    test.assert_eq_str(mailctype.transfer_encoding_name(mailxfer.choose_encoding(one_line)),
+                       "quoted-printable")
+
+@test
+fn test_the_newline_conversions_handle_a_lone_break() [io]
+    let lone_lf = bytes.from_str("a\nb")
+    test.assert_eq_str(bytes.to_str(mailxfer.to_crlf(lone_lf)), "a\r\nb")
+    let cr = mailxfer.to_crlf(bytes.from_str("a\rb"))
+    test.assert_eq_str(bytes.to_str(cr), "a\r\nb")
+    test.assert_eq_str(bytes.to_str(mailxfer.to_lf(cr)), "a\nb")
+    test.assert_eq_str(bytes.to_str(mailxfer.to_lf(lone_lf)), "a\nb")
+    test.assert_eq_str(bytes.to_str(mailxfer.to_lf(bytes.from_str("a\rb"))), "a\nb")
+
+// ── mailctype: the parameter grammar ─────────────────────────────────
+
+@test
+fn test_a_content_type_refuses_what_it_cannot_read() [io]
+    for bad in ["", "text", "text/", "text/plain x", "text/plain; =v", "text/plain; name",
+                "text/plain; name=;"]
+        match mailctype.parse_content_type(bad)
+            Ok(ct) => test.fail("a malformed content type parsed: ${bad}")
+            Err(e) => test.assert_true(str.len(e.message()) > 0, "every refusal says why")
+
+    test.case("and an unclosed quoted value is one of them")
+    match mailctype.parse_content_type("text/plain; name=\"abc")
+        Ok(ct) => test.fail("an unclosed quoted value parsed")
+        Err(e) => test.assert_true(str.len(e.message()) > 0, "the refusal says why")
+
+@test
+fn test_a_content_type_reads_a_parameter_wide() [io]
+    test.case("a quoted value carries its escapes through")
+    match mailctype.parse_content_type("text/plain; name=\"a\\\"b\"")
+        Ok(ct) => test.assert_eq_str(mailctype.param_value(ct, "name"), "a\"b")
+        Err(e) => test.fail(e.message())
+
+    test.case("a value that ends at a semicolon is a value, not a refusal")
+    match mailctype.parse_content_type("text/plain; name=abc; x=1")
+        Ok(ct) =>
+            test.assert_eq_str(mailctype.param_value(ct, "name"), "abc")
+            test.assert_eq_str(mailctype.param_value(ct, "x"), "1")
+        Err(e) => test.fail(e.message())
+
+    test.case("a folded parameter list is read like any other")
+    match mailctype.parse_content_type("text/plain;\r\n name=abc")
+        Ok(ct) => test.assert_eq_str(mailctype.param_value(ct, "name"), "abc")
+        Err(e) => test.fail(e.message())
+
+    test.case("an RFC 2231 continuation is assembled before a caller sees it")
+    match mailctype.parse_content_type("text/plain; filename*0=\"a\"; filename*1=\"b\"")
+        Ok(ct) => test.assert_eq_str(mailctype.param_value(ct, "filename"), "ab")
+        Err(e) => test.fail(e.message())
+
+    test.case("a continuation naming a charset this package converts is decoded")
+    match mailctype.parse_content_type("text/plain; filename*=utf-8''a%20b")
+        Ok(ct) => test.assert_eq_str(mailctype.param_value(ct, "filename"), "a b")
+        Err(e) => test.fail(e.message())
+
+    test.case("a continuation that cannot be assembled is refused")
+    match mailctype.parse_content_type("text/plain; filename*1=x")
+        Ok(ct) => test.fail("a continuation with no section 0 parsed")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "bad-parameter-continuation")
+
+    test.case("a charset this package does not convert is refused, and is unrenderable")
+    match mailctype.parse_content_type("text/plain; filename*=x-mac-ce''a")
+        Ok(ct) => test.fail("a parameter in an unknown charset parsed")
+        Err(e) =>
+            test.assert_eq_str(mailerror.code(e), "unknown-charset")
+            test.assert(mailerror.is_unrenderable(e))
+
+@test
+fn test_formatting_a_content_type_round_trips_what_it_must_quote() [io]
+    test.case("a value with a quote in it comes back as the same value")
+    let ct = mailctype.content_type("text", "plain", [mailctype.param("name", "a\"b")])
+    let written = mailctype.format_content_type(ct)
+    match mailctype.parse_content_type(written)
+        Ok(back) => test.assert_eq_str(mailctype.param_value(back, "name"), "a\"b")
+        Err(e)   => test.fail(e.message())
+
+    test.case("a parameter value with a space is written and read back")
+    let spaced = mailctype.content_type("text", "plain", [mailctype.param("name", "a b")])
+    match mailctype.parse_content_type(mailctype.format_content_type(spaced))
+        Ok(back) => test.assert_eq_str(mailctype.param_value(back, "name"), "a b")
+        Err(e)   => test.fail(e.message())
+
+    test.case("a value too long for one line is written as RFC 2231 sections")
+    var pieces: [Str] = []
+    var i = 0
+    while i < 100
+        if i % 7 == 0
+            list.push(pieces, "-")
+        elif i % 11 == 0
+            list.push(pieces, "A")
+        elif i % 5 == 0
+            list.push(pieces, "1")
+        else
+            list.push(pieces, "x")
+        i = i + 1
+    let long = str.join(pieces, "")
+    let wide = mailctype.content_type("text", "plain", [mailctype.param("name", long)])
+    let wide_text = mailctype.format_content_type(wide)
+    test.assert(str.contains(wide_text, "name*0*"))
+    match mailctype.parse_content_type(wide_text)
+        Ok(back) => test.assert_eq_str(mailctype.param_value(back, "name"), long)
+        Err(e)   => test.fail(e.message())
+
+@test
+fn test_content_type_predicates_and_lookups() [io]
+    test.assert(mailctype.is_multipart(mailctype.content_type("multipart", "mixed", [])))
+    test.assert_false(mailctype.is_multipart(mailctype.content_type("text", "plain", [])),
+                      "text/plain is not a multipart")
+    test.assert(mailctype.is_message(mailctype.content_type("message", "rfc822", [])))
+    test.assert_false(mailctype.is_message(mailctype.content_type("text", "plain", [])),
+                      "text/plain is not a message")
+    test.assert_eq_str(mailctype.charset_of(mailctype.default_content_type()), "us-ascii")
+    test.assert_eq_str(mailctype.boundary_of(mailctype.content_type("multipart", "mixed", [])), "")
+    test.assert_eq_str(mailctype.param_value(mailctype.content_type("text", "plain", []), "nope"), "")
+
+    test.case("a charset this package does not convert is answered as written")
+    let odd = mailctype.content_type("text", "plain", [mailctype.param("charset", "x-mac-ce")])
+    test.assert_eq_str(mailctype.charset_of(odd), "x-mac-ce")
+
+    test.case("with_param replaces the first value of a name and keeps the rest")
+    let base = mailctype.content_type("text", "plain",
+        [mailctype.param("charset", "us-ascii"), mailctype.param("name", "a.txt")])
+    let changed = mailctype.with_param(base, "charset", "utf-8")
+    test.assert_eq_str(mailctype.param_value(changed, "charset"), "utf-8")
+    test.assert_eq_str(mailctype.param_value(changed, "name"), "a.txt")
+
+@test
+fn test_a_disposition_refuses_what_it_cannot_read() [io]
+    for bad in ["", "attachment; name", "attachment; name=\"abc"]
+        match mailctype.parse_disposition(bad)
+            Ok(d)  => test.fail("a malformed disposition parsed: ${bad}")
+            Err(e) => test.assert_true(str.len(e.message()) > 0, "every refusal says why")
+
+    test.case("and the reading it exists for")
+    match mailctype.parse_disposition("x-whatever; filename=a.txt")
+        Ok(d)  =>
+            test.assert(mailctype.disposition_is_attachment(d))
+            test.assert_eq_str(mailctype.filename_of(d), "a.txt")
+        Err(e) => test.fail(e.message())
+    test.assert_eq_str(mailctype.disposition_name(MailInlineDisposition), "inline")
+    test.assert_eq_str(mailctype.disposition_name(MailAttachmentDisposition), "attachment")
+
+@test
+fn test_every_transfer_encoding_is_named() [io]
+    test.assert_eq_str(mailctype.transfer_encoding_name(MailSevenBit), "7bit")
+    test.assert_eq_str(mailctype.transfer_encoding_name(MailEightBit), "8bit")
+    test.assert_eq_str(mailctype.transfer_encoding_name(MailBinary), "binary")
+    test.assert_eq_str(mailctype.transfer_encoding_name(MailQuotedPrintable), "quoted-printable")
+    test.assert_eq_str(mailctype.transfer_encoding_name(MailBase64Encoding), "base64")
+    for name in ["7bit", "8bit", "binary", "quoted-printable", "base64"]
+        match mailctype.parse_transfer_encoding(name)
+            Ok(e)  => test.assert_eq_str(mailctype.transfer_encoding_name(e), name)
+            Err(x) => test.fail(x.message())
+    match mailctype.parse_transfer_encoding("x-uuencode")
+        Ok(e)  => test.fail("an encoding this package does not know parsed")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "unknown-transfer-encoding")
+
+// ── mailword: the codecs and the RFC 2231 sections ───────────────────
+
+@test
+fn test_an_encoded_word_reads_both_ways() [io]
+    test.case("Q, B, and the whitespace between two adjacent words")
+    match mailword.decode_text("=?utf-8?Q?Ada_Lovelace?=")
+        Ok(s)  => test.assert_eq_str(s, "Ada Lovelace")
+        Err(e) => test.fail(e.message())
+    match mailword.decode_text("=?utf-8?B?SGVsbG8=?= there")
+        Ok(s)  => test.assert_eq_str(s, "Hello there")
+        Err(e) => test.fail(e.message())
+    match mailword.decode_text("=?utf-8?Q?=C3=A9?=")
+        Ok(s)  => test.assert_eq_str(s, "\u{e9}")
+        Err(e) => test.fail(e.message())
+
+    test.case("iso-8859-1 and us-ascii name the two other sets")
+    match mailword.decode_text("=?iso-8859-1?Q?Caf=E9?=")
+        Ok(s)  => test.assert_eq_str(s, "Caf\u{e9}")
+        Err(e) => test.fail(e.message())
+    match mailword.decode_text("=?us-ascii?Q?hi?=")
+        Ok(s)  => test.assert_eq_str(s, "hi")
+        Err(e) => test.fail(e.message())
+
+    test.case("a language tag after the charset is carried, not refused")
+    match mailword.parse_word("=?utf-8*de?Q?a?=")
+        Ok(w)  =>
+            test.assert_eq_str(w.language, "de")
+            test.assert_eq_str(w.encoded_text, "a")
+        Err(e) => test.fail(e.message())
+
+    test.case("and the writer names its encoding and charset")
+    test.assert_eq_str(mailword.encoding_name(MailBEncoding), "B")
+    test.assert_eq_str(mailword.encoding_name(MailQEncoding), "Q")
+    test.assert_eq_str(mailword.charset_name(MailUsAscii), "us-ascii")
+    test.assert_eq_str(mailword.charset_name(MailLatin1), "iso-8859-1")
+    test.assert_eq_str(mailword.charset_name(MailUtf8), "utf-8")
+    test.assert_eq_str(mailword.encode_word("Ada", MailUtf8, MailBEncoding), "=?utf-8?B?QWRh?=")
+
+@test
+fn test_the_charsets_this_package_converts_and_the_ones_it_does_not() [io]
+    test.assert_eq_str(mailword.charset_name(mailword.charset_named("ASCII") ?? MailUtf8), "us-ascii")
+    test.assert_eq_str(mailword.charset_name(mailword.charset_named(" latin1 ") ?? MailUtf8),
+                       "iso-8859-1")
+    test.assert_eq_str(mailword.charset_name(mailword.charset_named("UTF8") ?? MailLatin1), "utf-8")
+    test.assert(mailword.charset_named("x-mac-ce") == None)
+
+    test.case("a word naming one of the other sets is refused, and is unrenderable")
+    match mailword.decode_text("=?x-mac-ce?Q?a?=")
+        Ok(s)  => test.fail("a word in an unknown charset decoded")
+        Err(e) =>
+            test.assert_eq_str(mailerror.code(e), "unknown-charset")
+            test.assert(mailerror.is_unrenderable(e))
+
+@test
+fn test_a_malformed_encoded_word_stays_text() [io]
+    test.case("one that never closes on its line is literal")
+    match mailword.decode_text("=?utf-8?Q?no close")
+        Ok(s)  => test.assert_eq_str(s, "=?utf-8?Q?no close")
+        Err(e) => test.fail(e.message())
+
+    test.case("and one whose text runs over a line break is literal too")
+    match mailword.decode_text("=?utf-8?Q?a\rb?=")
+        Ok(s)  => test.assert_eq_str(s, "=?utf-8?Q?a\rb?=")
+        Err(e) => test.fail(e.message())
+
+    test.case("a word that is not a word at all is literal")
+    match mailword.decode_text("=?not-a-word")
+        Ok(s)  => test.assert_eq_str(s, "=?not-a-word")
+        Err(e) => test.fail(e.message())
+
+    test.case("an escape that is not hexadecimal is the one refusal")
+    match mailword.decode_text("=?utf-8?Q?=ZZ?=")
+        Ok(s)  => test.fail("a bad Q escape decoded")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "bad-encoded-word")
+
+@test
+fn test_encode_text_writes_the_words_the_octets_need() [io]
+    test.case("text that needs no encoding is written as it stands")
+    test.assert_eq_str(mailword.encode_text("plain ascii", MailUtf8), "plain ascii")
+    test.assert_false(mailword.needs_encoding("plain ascii"), "ASCII needs no encoding")
+    test.assert(mailword.needs_encoding("caf\u{e9}"))
+
+    test.case("a mostly-ASCII word keeps the readable Q encoding")
+    let q = mailword.encode_text("Caf\u{e9}", MailLatin1)
+    test.assert_true(str.starts_with(q, "=?iso-8859-1?Q?"), "a readable word is Q")
+    match mailword.decode_text(q)
+        Ok(s)  => test.assert_eq_str(s, "Caf\u{e9}")
+        Err(e) => test.fail(e.message())
+
+    test.case("a word that is mostly not ASCII is B, and no character is split")
+    var wide: [Str] = []
+    var i = 0
+    while i < 40
+        list.push(wide, "\u{e9}")
+        i = i + 1
+    let long = str.join(wide, "")
+    let b = mailword.encode_text(long, MailUtf8)
+    test.assert_true(str.starts_with(b, "=?utf-8?B?"), "an unreadable word is B")
+    match mailword.decode_text(b)
+        Ok(s)  => test.assert_eq_str(s, long)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_latin1_receives_one_question_mark_per_character() [io]
+    test.case("a character Latin-1 has no octet for becomes one ?")
+    test.assert_eq_str(mailword.encode_word("A\u{100}", MailLatin1, MailBEncoding),
+                       "=?iso-8859-1?B?QT8=?=")
+    test.assert_eq_str(mailword.encode_word("\u{20ac}", MailLatin1, MailBEncoding),
+                       "=?iso-8859-1?B?Pw==?=")
+
+    test.case("a four-octet character is one character, not four")
+    test.assert_eq_str(mailword.encode_word("\u{1f600}", MailLatin1, MailBEncoding),
+                       "=?iso-8859-1?B?Pw==?=")
+
+@test
+fn test_a_parameter_is_split_and_assembled_again() [io]
+    test.case("the plain form is left alone, because a receiver must read it")
+    test.assert_eq(list.len(mailword.split_parameter("filename", "report.pdf", MailUsAscii)), 1)
+    match mailword.assemble_parameter("filename", [("filename", "report.pdf")])
+        Ok(s)  => test.assert_eq_str(s, "report.pdf")
+        Err(e) => test.fail(e.message())
+
+    test.case("a value too long for one line is split into sections and reassembled")
+    var run: [Str] = []
+    var i = 0
+    while i < 60
+        list.push(run, "\u{e9}")
+        i = i + 1
+    let value = str.join(run, "")
+    let sections = mailword.split_parameter("filename", value, MailUtf8)
+    test.assert_true(list.len(sections) > 1, "a long value takes several sections")
+    match mailword.assemble_parameter("filename", sections)
+        Ok(s)  => test.assert_eq_str(s, value)
+        Err(e) => test.fail(e.message())
+
+    test.case("an extended section with no charset prefix is the octets it names")
+    match mailword.assemble_parameter("filename", [("filename*0*", "plain")])
+        Ok(s)  => test.assert_eq_str(s, "plain")
+        Err(e) => test.fail(e.message())
+
+    test.case("and one with half a prefix is also read as octets")
+    match mailword.assemble_parameter("filename", [("filename*0*", "utf-8'only")])
+        Ok(s)  => test.assert_eq_str(s, "utf-8'only")
+        Err(e) => test.fail(e.message())
+
+    test.case("a section that names another parameter is not this one")
+    match mailword.assemble_parameter("filename", [("other*0*", "x")])
+        Ok(s)  => test.fail("a parameter with no section answered Ok")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "bad-parameter-continuation")
+
+    test.case("the plain and numbered forms together are refused")
+    match mailword.assemble_parameter("filename", [("filename", "a"), ("filename*0*", "b")])
+        Ok(s)  => test.fail("two forms for one name assembled")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "bad-parameter-continuation")
+
+    test.case("a section number that is not a number belongs to nobody")
+    match mailword.assemble_parameter("filename", [("filename*x*", "a")])
+        Ok(s)  => test.fail("a non-numeric section assembled")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "bad-parameter-continuation")
+
+    test.case("an empty value is one empty section")
+    test.assert_eq(list.len(mailword.split_parameter("a-name-long-enough-to-miss-the-line-limit-and-then-some", "", MailUtf8)),
+        1)
+
+// ── mailhdr: dates, folding and the header section ───────────────────
+
+@test
+fn test_a_header_section_refuses_a_line_it_cannot_read() [io]
+    test.case("a line with no colon at all")
+    match mailhdr.parse_headers(bytes.from_str("Subject Hi\r\n\r\nbody"), 0)
+        Ok(p)  => test.fail("a line with no colon parsed")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "header-malformed")
+
+    test.case("and a field name with an octet a name may not carry")
+    match mailhdr.parse_headers(bytes.from_str("Sub ject: Hi\r\n\r\nbody"), 0)
+        Ok(p)  => test.fail("a name with a space parsed")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "bad-field-name")
+
+    test.case("the blank line is what ends the section, three ways")
+    for breaks in ["\r\n\r\n", "\n\n", "\r\r"]
+        let source = bytes.from_str("Subject: Hi${breaks}body")
+        match mailhdr.parse_headers(source, 0)
+            Ok(p)  => test.assert_eq_str(
+                          bytes.to_str(mailxfer.slice(source, mailxfer.span(p.body_offset, 4))!),
+                          "body")
+            Err(e) => test.fail(e.message())
+
+@test
+fn test_a_date_is_read_with_its_comments_and_its_obsolete_zone() [io]
+    test.case("comments come out before the tokens are read")
+    match mailhdr.parse_date("Fri, 21 Nov 1997 09:55:06 +0000 (a (nested) comment)")
+        Ok(d)  => test.assert_eq(d.offset_minutes, 0)
+        Err(e) => test.fail(e.message())
+
+    test.case("including one with an escape in it")
+    match mailhdr.parse_date("21 Nov 1997 09:55:06 GMT (a \\) bracket)")
+        Ok(d)  => test.assert_eq(d.offset_minutes, 0)
+        Err(e) => test.fail(e.message())
+
+    test.case("a stray octet between the components is skipped, not refused")
+    match mailhdr.parse_date("Fri, 21/Nov/1997 09:55:06 +0000")
+        Ok(d)  => test.assert_eq(d.offset_minutes, 0)
+        Err(e) => test.fail(e.message())
+
+    test.case("the numeric month form reads the same date")
+    match mailhdr.parse_date("21 11 1997 09:55:06 +0000")
+        Ok(d)  => test.assert_eq(d.local.date.month, 11)
+        Err(e) => test.fail(e.message())
+
+    test.case("every obsolete zone name is in the table")
+    test.assert_eq(mailhdr.parse_date("21 Nov 1997 09:55:06 EST")!.offset_minutes, -300)
+    test.assert_eq(mailhdr.parse_date("21 Nov 1997 09:55:06 CDT")!.offset_minutes, -300)
+    test.assert_eq(mailhdr.parse_date("21 Nov 1997 09:55:06 CST")!.offset_minutes, -360)
+    test.assert_eq(mailhdr.parse_date("21 Nov 1997 09:55:06 MDT")!.offset_minutes, -360)
+    test.assert_eq(mailhdr.parse_date("21 Nov 1997 09:55:06 EDT")!.offset_minutes, -240)
+    test.assert_eq(mailhdr.parse_date("21 Nov 1997 09:55:06 MST")!.offset_minutes, -420)
+    test.assert_eq(mailhdr.parse_date("21 Nov 1997 09:55:06 PDT")!.offset_minutes, -420)
+    test.assert_eq(mailhdr.parse_date("21 Nov 1997 09:55:06 PST")!.offset_minutes, -480)
+    test.assert_eq(mailhdr.parse_date("21 Nov 1997 09:55:06 UT")!.offset_minutes, 0)
+    test.assert_eq(mailhdr.parse_date("21 Nov 1997 09:55:06 Z")!.offset_minutes, 0)
+    test.case("and the military letters RFC 5322 § 4.3 leaves J out of")
+    test.assert_eq(mailhdr.parse_date("21 Nov 1997 09:55:06 A")!.offset_minutes, 60)
+    test.assert_eq(mailhdr.parse_date("21 Nov 1997 09:55:06 I")!.offset_minutes, 540)
+    test.assert_eq(mailhdr.parse_date("21 Nov 1997 09:55:06 K")!.offset_minutes, 600)
+    test.assert_eq(mailhdr.parse_date("21 Nov 1997 09:55:06 L")!.offset_minutes, 660)
+    test.assert_eq(mailhdr.parse_date("21 Nov 1997 09:55:06 M")!.offset_minutes, 720)
+    test.assert_eq(mailhdr.parse_date("21 Nov 1997 09:55:06 N")!.offset_minutes, -60)
+    test.assert_eq(mailhdr.parse_date("21 Nov 1997 09:55:06 Y")!.offset_minutes, -720)
+
+    test.case("a zone this package does not know is a date it cannot place")
+    match mailhdr.parse_date("21 Nov 1997 09:55:06 J")
+        Ok(d)  => test.fail("a date in a zone that is not one parsed")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "bad-date")
+    match mailhdr.parse_date("21 Nov 1997 09:55:06 XYZ")
+        Ok(d)  => test.fail("a date in a zone that is not one parsed")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "bad-date")
+
+@test
+fn test_a_date_refuses_a_value_that_is_not_a_date() [io]
+    test.case("a month a civil date cannot have")
+    match mailhdr.parse_date("31 Feb 1997 09:55:06 +0000")
+        Ok(d)  => test.fail("the thirty-first of February parsed")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "bad-date")
+
+    test.case("and a clock that cannot exist")
+    match mailhdr.parse_date("21 Nov 1997 25:55:06 +0000")
+        Ok(d)  => test.fail("hour twenty-five parsed")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "bad-date")
+
+    test.case("a seventh number has nowhere to go")
+    match mailhdr.parse_date("21 Nov 1997 09:55:06 +0000 12")
+        Ok(d)  => test.fail("a seventh component parsed")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "bad-date")
+
+    test.case("and a value with no zone at all cannot be placed")
+    match mailhdr.parse_date("21 Nov 1997 09:55:06")
+        Ok(d)  => test.fail("a date with no zone parsed")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "bad-date")
+
+@test
+fn test_an_unknown_offset_is_written_as_minus_zero() [io]
+    match mailhdr.parse_date("Fri, 21 Nov 1997 09:55:06 -0000")
+        Ok(d)  =>
+            test.assert_false(d.offset_known, "minus zero says the zone is unknown")
+            test.assert(str.ends_with(mailhdr.format_date(d), " -0000"))
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_message_identifier_must_be_one() [io]
+    match mailhdr.parse_message_id("<abc@example.com>")
+        Ok(m)  => test.assert_eq_str(mailhdr.format_message_id(m), "<abc@example.com>")
+        Err(e) => test.fail(e.message())
+    match mailhdr.parse_message_id("<ab>")
+        Ok(m)  => test.fail("an identifier with no at sign parsed")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "bad-message-id")
+    match mailhdr.parse_message_id("abc@example.com")
+        Ok(m)  => test.fail("an identifier with no brackets parsed")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "bad-message-id")
+
+    test.case("a whole References list, and the two ways it breaks")
+    match mailhdr.parse_message_ids("<a@x> <b@x>")
+        Ok(ms) => test.assert_eq(list.len(ms), 2)
+        Err(e) => test.fail(e.message())
+    match mailhdr.parse_message_ids("<a@x> <nope>")
+        Ok(ms) => test.fail("a malformed identifier in a list parsed")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "bad-message-id")
+    match mailhdr.parse_message_ids("<a@x")
+        Ok(ms) => test.fail("an unclosed identifier parsed")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "bad-message-id")
+
+@test
+fn test_a_header_section_keeps_and_drops_what_it_is_asked_to() [io]
+    let one = mailhdr.headers([mailhdr.field("Subject", "Hi")])
+    test.assert_eq_str(mailhdr.without(one, "bcc").fields[0].name, "Subject")
+    test.assert_eq(list.len(mailhdr.without(one, "subject").fields), 0)
+    test.assert_eq_str(mailhdr.append(one, mailhdr.field("Cc", "a@b.c")).fields[1].name, "Cc")
+    test.assert_eq_str(mailhdr.prepend(one, mailhdr.field("Received", "x")).fields[0].name, "Received")
+
+    test.case("a fold is removed and the whitespace under it is what separates")
+    test.assert_eq_str(mailhdr.unfold("Hello\r\n world"), "Hello world")
+    test.assert_eq_str(mailhdr.unfold("Hello\r world"), "Hello world")
+    test.assert_eq_str(mailhdr.unfold("Hello\n world"), "Hello world")
+
+    test.case("and a break that folds nothing is carried through")
+    test.assert_eq_str(mailhdr.unfold("one\r\ntwo"), "one\r\ntwo")
+
+@test
+fn test_folding_breaks_only_where_it_may() [io]
+    test.case("a body with no whitespace to fold at is emitted over-length")
+    let long = str.join(["a", "a", "a"], "")
+    test.assert_eq_str(mailhdr.fold("Subject", long, 5), "Subject: aaa")
+
+    test.case("a quoted string is not folded inside")
+    let quoted = "\"a b c d e f g h\" <x@y.z>"
+    let out = mailhdr.fold("To", quoted, 20)
+    test.assert_true(str.contains(out, "\r\n "), "there is a fold somewhere")
+    test.assert_eq_str(mailhdr.unfold(out), "To: ${quoted}")
+
+    test.case("and a backslash inside the quotes is not a fold point either")
+    let escaped = "\"a \\\" b c d e f\" <x@y.z>"
+    let out2 = mailhdr.fold("To", escaped, 20)
+    test.assert_eq_str(mailhdr.unfold(out2), "To: ${escaped}")
+
+// ── mailaddr: quoting, comments and the entry grammar ────────────────
+
+@test
+fn test_an_address_reads_the_quoting_and_the_comments() [io]
+    test.case("a quoted local part keeps its at sign")
+    match mailaddr.parse_address("\"a@b\"@example.com")
+        Ok(a)  => test.assert_eq_str(a.local_part, "a@b")
+        Err(e) => test.fail(e.message())
+
+    test.case("a quoted local part resolves its escapes")
+    match mailaddr.parse_address("\"a\\\"b\"@example.com")
+        Ok(a)  => test.assert_eq_str(a.local_part, "a\"b")
+        Err(e) => test.fail(e.message())
+
+    test.case("a comment becomes the whitespace it stands for")
+    match mailaddr.parse_address("Ada (the countess) <ada@example.com>")
+        Ok(a)  => test.assert_eq_str(a.display_name, "Ada")
+        Err(e) => test.fail(e.message())
+
+    test.case("including one whose brackets are escaped, so it ends elsewhere")
+    match mailaddr.parse_address("Ada (the \\(first\\) countess) <ada@example.com>")
+        Ok(a)  => test.assert_eq_str(a.display_name, "Ada")
+        Err(e) => test.fail(e.message())
+
+    test.case("and one with a bracket that is not escaped does end it")
+    match mailaddr.parse_address("Ada (the \\(first) countess) <ada@example.com>")
+        Ok(a)  =>
+            test.assert_true(str.starts_with(a.display_name, "Ada"), "the name comes first")
+            test.assert_true(str.contains(a.display_name, "countess)"),
+                          "what followed the comment is left on the page")
+        Err(e) => test.fail(e.message())
+
+    test.case("and a digit is a letter as far as a local part goes")
+    match mailaddr.parse_address("j2@ex2ample.com")
+        Ok(a)  => test.assert_eq_str(a.local_part, "j2")
+        Err(e) => test.fail(e.message())
+
+    test.case("a display name with a quote in it comes back quoted")
+    test.assert_eq_str(mailaddr.format_address(mailaddr.named_address("a\"b", "j", "d.e")),
+                       "\"a\\\"b\" <j@d.e>")
+
+    test.case("a name above ASCII is encoded on the way out")
+    let encoded = mailaddr.format_address(mailaddr.named_address("Caf\u{e9}", "j", "d.e"))
+    test.assert_true(str.starts_with(encoded, "=?"), "a non-ASCII name is an encoded word")
+
+    test.case("and a group with no members is written as one")
+    test.assert_eq_str(mailaddr.format_entries([MailGroupOf(mailaddr.group("undisclosed-recipients", []))]),
+                       "undisclosed-recipients:;")
+
+@test
+fn test_an_address_refuses_what_is_not_one() [io]
+    match mailaddr.parse_address("Friends: alan@example.com;")
+        Ok(a)  => test.fail("a group parsed as one mailbox")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "bad-address")
+    match mailaddr.parse_address("a@b.c, d@e.f")
+        Ok(a)  => test.fail("two mailboxes parsed as one")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "bad-address")
+
+    test.case("an entry with nothing in it, and an angle that never closes")
+    match mailaddr.parse_entries("a@b.c, , c@d.e")
+        Ok(es) => test.fail("an empty entry parsed")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "bad-address")
+    match mailaddr.parse_entries("Ada <ada@example.com")
+        Ok(es) => test.fail("an unclosed angle address parsed")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "bad-address")
+
+    test.case("an empty local part and an empty domain")
+    match mailaddr.parse_entries("@b.c")
+        Ok(es) => test.fail("an address with no local part parsed")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "bad-address")
+    match mailaddr.parse_entries("a@")
+        Ok(es) => test.fail("an address with no domain parsed")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "bad-address")
+
+    test.case("a group name in a charset this package cannot convert")
+    match mailaddr.parse_entries("=?x-mac-ce?Q?a?=: x@y.z;")
+        Ok(es) => test.fail("a group in an unknown charset parsed")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "unknown-charset")
+
+    test.case("a display name in one either")
+    match mailaddr.parse_entries("=?x-mac-ce?Q?a?= <x@y.z>")
+        Ok(es) => test.fail("a name in an unknown charset parsed")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "unknown-charset")
+
+    test.case("a group that is never closed, and a member that is not one")
+    match mailaddr.parse_entries("Friends: x@y.z")
+        Ok(es) => test.fail("an unclosed group parsed")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "bad-address")
+    match mailaddr.parse_entries("Friends: nope;")
+        Ok(es) => test.fail("a member that is not an address parsed")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "bad-address")
+
+    test.case("and an entry that is not followed by a comma")
+    match mailaddr.parse_entries("Friends: x@y.z; and then some words")
+        Ok(es) => test.fail("an entry with no comma after it parsed")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "bad-address")
+
+    test.case("a list with whitespace after its last entry is just that list")
+    match mailaddr.parse_entries("a@b.c, ")
+        Ok(es) => test.assert_eq(list.len(es), 1)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_an_addr_spec_is_valid_or_it_is_not() [io]
+    test.assert(mailaddr.is_valid_addr_spec("A1@B-example.com"))
+    test.assert(mailaddr.is_valid_addr_spec("a.b@example.com"))
+    test.assert(mailaddr.is_valid_addr_spec("a@[192.0.2.1]"))
+    test.assert(mailaddr.is_valid_addr_spec("\"a b\"@example.com"))
+
+    test.case("a local part that starts or ends with a dot, or doubles one")
+    test.assert_false(mailaddr.is_valid_addr_spec(".a@b.c"), "a leading dot is not a local part")
+    test.assert_false(mailaddr.is_valid_addr_spec("a.@b.c"), "a trailing dot is not one")
+    test.assert_false(mailaddr.is_valid_addr_spec("a..b@c.d"), "two dots in a row are not one")
+    test.assert_false(mailaddr.is_valid_addr_spec("a b@c.d"), "a space is not one")
+
+    test.case("and a domain that does the same, or carries a stray octet")
+    test.assert_false(mailaddr.is_valid_addr_spec("a@.b.c"), "a leading dot is not a domain")
+    test.assert_false(mailaddr.is_valid_addr_spec("a@b.c."), "a trailing dot is not one")
+    test.assert_false(mailaddr.is_valid_addr_spec("a@b..c"), "two dots in a row are not one")
+    test.assert_false(mailaddr.is_valid_addr_spec("a@b_c.d"), "an underscore is not one")
+
+    test.case("a quoted local part that is not closed both ends")
+    test.assert_false(mailaddr.is_valid_addr_spec("\"a\"b@c.d"), "half a quoted string")
+
+@test
+fn test_a_long_address_list_is_folded_at_its_commas() [io]
+    var entries: [mailaddr.MailEntry] = []
+    var i = 0
+    while i < 12
+        list.push(entries, MailMailbox(mailaddr.addr_spec("someone-with-a-long-local-part", "example.com")))
+        i = i + 1
+    let written = mailaddr.format_entries(entries)
+    test.assert_true(str.contains(written, ",\r\n "), "the list is folded at a comma")
+    test.assert_eq(list.len(mailaddr.parse_entries(mailhdr.unfold(written))!), 12)
+
+// ── mailmime: the tree, the boundary and the writer ──────────────────
+
+fn a_two_part_message() -> Bytes
+    bytes.from_str("Content-Type: multipart/mixed; boundary=\"sep\"\r\n\r\nThis is the preamble.\r\n--sep\r\nContent-Type: text/plain; charset=iso-8859-1\r\n\r\nCaf\xe9 latin\r\n--sep\r\nContent-Type: application/octet-stream; name=\"a.bin\"\r\n\r\nbinary\r\n--sep--\r\nThis is the epilogue.")
+
+@test
+fn test_a_part_is_written_back_the_way_it_came() [io]
+    let src = bytes.from_str("Content-Type: text/plain; charset=us-ascii\r\n\r\nhi there")
+    match mailmsg.parse(src, 32)
+        Ok(m)  =>
+            match mailmime.format_part(m.source, m.root)
+                Ok(s)  => test.assert(str.ends_with(s, "hi there"))
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+    test.case("a multipart is written back with its delimiters")
+    match mailmsg.parse(a_two_part_message(), 32)
+        Ok(m)  =>
+            match mailmime.format_part(m.source, m.root)
+                Ok(s)  =>
+                    test.assert(str.contains(s, "--sep\r\n"))
+                    test.assert(str.contains(s, "--sep--\r\n"))
+                    test.assert(str.ends_with(s, "This is the epilogue.\r\n"))
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+    test.case("a part whose span is not in these octets is refused, not guessed at")
+    match mailmime.format_part(bytes.from_str("tiny"),
+                               mailmime.leaf_part(mailctype.default_content_type(),
+                                                  mailxfer.span(0, 400)))
+        Ok(s)  => test.fail("a span outside the source was written")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "span-out-of-range")
+
+    test.case("and a multipart with no boundary cannot be written at all")
+    match mailmime.format_part(bytes.from_str("x"),
+                               mailmime.multipart_part(
+                                   mailctype.content_type("multipart", "mixed", []), []))
+        Ok(s)  => test.fail("a multipart with no boundary was written")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "missing-boundary")
+
+    test.case("a message/rfc822 part is written with the message inside it")
+    match mailmime.format_part(bytes.from_str("hello\r\n"),
+                               mailmime.multipart_part(
+                                   mailctype.content_type("message", "rfc822", []),
+                                   [mailmime.leaf_part(mailctype.default_content_type(),
+                                                       mailxfer.span(0, 5))]))
+        Ok(s)  => test.assert(str.ends_with(s, "hello"))
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_body_is_decoded_in_its_own_charset() [io]
+    let src = a_two_part_message()
+    match mailmsg.parse(src, 32)
+        Ok(m)  => test.assert_eq_str(mailmsg.text_of(m)!, "Caf\u{e9} latin")
+        Err(e) => test.fail(e.message())
+
+    test.case("a charset this package does not convert is a refusal, and the octets stay reachable")
+    let odd = bytes.from_str("Content-Type: text/plain; charset=x-mac-ce\r\n\r\nhi")
+    match mailmsg.parse(odd, 32)
+        Ok(m)  =>
+            match mailmime.decoded_text(m.source, m.root)
+                Ok(s)  => test.fail("a body in an unknown charset decoded")
+                Err(e) => test.assert_eq_str(mailerror.code(e), "unknown-charset")
+            match mailmime.decoded_body(m.source, m.root)
+                Ok(b)  => test.assert_eq_str(bytes.to_str(b), "hi")
+                Err(e) => test.fail(e.message())
+        Err(e) => test.fail(e.message())
+
+    test.case("and a body that is not the encoding it claims is the other refusal")
+    let bad = bytes.from_str("Content-Type: text/plain\r\nContent-Transfer-Encoding: base64\r\n\r\n!!!")
+    match mailmsg.parse(bad, 32)
+        Ok(m)  =>
+            match mailmime.decoded_text(m.source, m.root)
+                Ok(s)  => test.fail("a body that is not base64 decoded")
+                Err(e) => test.assert_eq_str(mailerror.code(e), "bad-base64")
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_multipart_is_read_for_what_it_names() [io]
+    match mailmsg.parse(a_two_part_message(), 32)
+        Ok(m)  =>
+            test.case("the preamble and the epilogue are kept, and are not parts")
+            test.assert_eq_str(
+                bytes.to_str(mailxfer.slice(m.source, m.root.preamble)!),
+                "This is the preamble.\r\n")
+            test.assert_eq_str(
+                bytes.to_str(mailxfer.slice(m.source, m.root.epilogue)!),
+                "This is the epilogue.")
+
+            test.case("a named part that is not the body text is one a caller offers as a file")
+            let files = mailmime.attachments_of(m.root)
+            test.assert_eq(list.len(files), 1)
+            test.assert_eq_str(mailmime.filename_of(files[0]), "a.bin")
+
+            test.case("every part is in the walk, the parents before the children")
+            test.assert_eq(list.len(mailmime.walk_order(m.root)), 3)
+            test.assert_eq(list.len(mailmime.display_parts(m.root)), 2)
+
+            test.case("and the text arm is found and is not the HTML one")
+            test.assert_some(mailmime.text_part(m.root))
+            test.assert_none(mailmime.html_part(m.root))
+
+        Err(e) => test.fail(e.message())
+
+    test.case("a part with no name is carried by nobody and is not the body text")
+    let odd = bytes.from_str("Content-Type: application/octet-stream\r\n\r\n\x01\x02")
+    match mailmsg.parse(odd, 32)
+        Ok(m)  =>
+            test.assert_eq(list.len(mailmime.attachments_of(m.root)), 0)
+            test.assert_none(mailmime.text_part(m.root))
+            test.assert_none(mailmime.html_part(m.root))
+            test.assert_eq_str(mailmsg.text_of(m)!, "")
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_multipart_refuses_what_it_cannot_walk() [io]
+    test.case("no boundary parameter at all")
+    let no_boundary = bytes.from_str("Content-Type: multipart/mixed\r\n\r\nbody")
+    match mailmsg.parse(no_boundary, 32)
+        Ok(m)  => test.fail("a multipart with no boundary parsed")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "missing-boundary")
+
+    test.case("and a boundary whose closing delimiter never arrives")
+    let unterminated = bytes.from_str("Content-Type: multipart/mixed; boundary=\"sep\"\r\n\r\n--sep\r\n\r\nbody")
+    match mailmsg.parse(unterminated, 32)
+        Ok(m)  => test.fail("a multipart with no closing delimiter parsed")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "boundary-unterminated")
+
+    test.case("a delimiter line that is not one is just body")
+    let almost = bytes.from_str("Content-Type: multipart/mixed; boundary=\"sep\"\r\n\r\n--sepx\r\nbody\r\n--sep--\r\n")
+    match mailmsg.parse(almost, 32)
+        Ok(m)  =>
+            test.assert_eq(list.len(m.root.children), 0)
+            test.assert_eq_str(bytes.to_str(mailxfer.slice(m.source, m.root.preamble)!),
+                               "--sepx\r\nbody\r\n")
+        Err(e) => test.fail(e.message())
+
+    test.case("one delimiter may carry the transport padding RFC 2046 allows")
+    let padded = bytes.from_str("Content-Type: multipart/mixed; boundary=\"sep\"\r\n\r\n--sep  \r\n\r\nbody\r\n--sep--  \r\n")
+    match mailmsg.parse(padded, 32)
+        Ok(m)  => test.assert_eq(list.len(m.root.children), 1)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_part_is_walked_as_deep_as_the_caller_allows() [io]
+    test.case("a message/rfc822 part is a child, not a leaf")
+    let inner = bytes.from_str("Content-Type: message/rfc822\r\n\r\nSubject: in\r\n\r\nin there")
+    match mailmsg.parse(inner, 32)
+        Ok(m)  =>
+            test.assert_eq(list.len(m.root.children), 1)
+            test.assert_eq_str(mailmsg.subject_of(m), "")
+        Err(e) => test.fail(e.message())
+
+    test.case("and the limit the caller set is where it stops")
+    match mailmsg.parse(inner, 0)
+        Ok(m)  => test.fail("a message part was read at depth zero")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "too-deep")
+
+    test.case("a multipart is refused at depth zero too")
+    let multi = bytes.from_str("Content-Type: multipart/mixed; boundary=\"s\"\r\n\r\n--s\r\n\r\nx\r\n--s--\r\n")
+    match mailmsg.parse(multi, 0)
+        Ok(m)  => test.fail("a multipart was read at depth zero")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "too-deep")
+
+@test
+fn test_a_part_is_found_by_its_content_id() [io]
+    let src = bytes.from_str("Content-Type: text/plain\r\nContent-ID: <logo@example.com>\r\n\r\nhi")
+    match mailmsg.parse(src, 32)
+        Ok(m)  =>
+            test.assert_eq_str(m.root.content_id, "logo@example.com")
+            test.assert_some(mailmime.part_by_content_id(m.root, "logo@example.com"))
+            test.assert_none(mailmime.part_by_content_id(m.root, "nothing@example.com"))
+            test.assert_none(mailmime.part_by_content_id(m.root, ""))
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_fresh_boundary_is_not_in_the_content() [io]
+    let body = bytes.from_str("--novo-mail-7\r\nnot a delimiter, just text")
+    let boundary = mailmime.fresh_boundary(body, 7)
+    test.assert_false(str.contains(bytes.to_str(body), boundary),
+                      "the boundary does not occur in the content")
+    test.assert(str.contains(boundary, "novo-mail-7-"))
+
+// ── mailmsg: the builder and the accessors ───────────────────────────
+
+@test
+fn test_a_draft_is_written_with_every_field_it_was_given() [io]
+    let author = mailaddr.addr_spec("ada", "example.com")
+    let d = mailmsg.with_header(
+                mailmsg.with_attachment(
+                    mailmsg.with_subject(
+                        mailmsg.with_text_body(
+                            mailmsg.with_from(mailmsg.draft(), [author]),
+                            "hello"),
+                        "Caf\u{e9} for two"),
+                    mailmsg.attachment("caf\u{e9}.txt",
+                                       mailctype.content_type("text", "plain", []),
+                                       bytes.from_str("hi"))),
+                mailhdr.field("Auto-Submitted", "auto-generated"))
+    let d2 = mailmsg.with_header(d, mailhdr.field("X-Second", "2"))
+    test.assert_eq(list.len(d2.extra), 2)
+    test.assert_eq(list.len(d2.attachments), 1)
+
+    match mailmsg.build(d2)
+        Ok(b)  =>
+            let text = bytes.to_str(b)
+            test.case("a non-ASCII subject is an encoded word")
+            test.assert(str.contains(text, "Subject: =?"))
+            test.case("and a non-ASCII filename is an RFC 2231 section")
+            test.assert(str.contains(text, "filename*0*="))
+            test.case("the extra fields are written last")
+            test.assert(str.contains(text, "Auto-Submitted: auto-generated\r\n"))
+        Err(e) => test.fail(e.message())
+
+    test.case("a message with two authors names its sender")
+    let two = MailDraft {
+        from: [author, mailaddr.addr_spec("grace", "example.com")],
+        sender: Some(author),
+        to: [],
+        cc: [],
+        bcc: [],
+        reply_to: [],
+        subject: "",
+        date: None,
+        message_id: None,
+        in_reply_to: [],
+        text_body: "hi",
+        html_body: "",
+        attachments: [],
+        extra: [] }
+    match mailmsg.build(two)
+        Ok(b)  => test.assert(str.contains(bytes.to_str(b), "Sender: ada@example.com\r\n"))
+        Err(e) => test.fail(e.message())
+
+    test.case("and one with two authors and no sender is refused")
+    let no_sender = MailDraft {
+        from: [author, mailaddr.addr_spec("grace", "example.com")],
+        sender: None,
+        to: [],
+        cc: [],
+        bcc: [],
+        reply_to: [],
+        subject: "",
+        date: None,
+        message_id: None,
+        in_reply_to: [],
+        text_body: "hi",
+        html_body: "",
+        attachments: [],
+        extra: [] }
+    match mailmsg.build(no_sender)
+        Ok(b)  => test.fail("a message with two authors and no sender was built")
+        Err(e) => test.assert_eq_str(mailerror.code(e), "bad-address")
+
+@test
+fn test_an_attachment_carried_by_a_cid_is_the_document_first() [io]
+    let author = mailaddr.addr_spec("ada", "example.com")
+    let logo = mailctype.content_type("image", "png", [])
+    let d = mailmsg.with_attachment(
+                mailmsg.with_from(
+                    mailmsg.with_html_body(mailmsg.draft(), "<p>Caf\u{e9} <img src=\"cid:logo@x\"></p>"),
+                    [author]),
+                mailmsg.inline_attachment("logo@x", logo, bytes.from_str("\x89PNG")))
+    match mailmsg.build(d)
+        Ok(b)  =>
+            let text = bytes.to_str(b)
+            test.assert(str.contains(text, "multipart/related"))
+            test.assert(str.contains(text, "Content-ID: <logo@x>\r\n"))
+            test.case("a body that is not ASCII says which set it is in")
+            test.assert(str.contains(text, "charset=utf-8"))
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_the_accessors_answer_for_the_fields_that_are_there() [io]
+    let src = bytes.from_str("From: Ada <ada@example.com>\r\nTo: a@b.c\r\nCc: c@d.e\r\nDate: Fri, 21 Nov 1997 09:55:06 +0000\r\nMessage-ID: <x@y.z>\r\nReferences: <p@y.z>\r\n\r\nhello")
+    match mailmsg.parse(src, 32)
+        Ok(m)  =>
+            test.assert_eq(list.len(mailmsg.from_of(m)!), 1)
+            test.assert_eq(list.len(mailmsg.recipients_of(m)!), 2)
+            test.assert_some(mailmsg.date_of(m)!)
+            test.assert_some(mailmsg.message_id_of(m)!)
+            test.assert_eq(list.len(mailmsg.thread_parents_of(m)!), 1)
+            test.assert_eq_str(mailmsg.text_of(m)!, "hello")
+        Err(e) => test.fail(e.message())
+
+    test.case("a field that is there and does not parse is a refusal, not a None")
+    let bad = bytes.from_str("Subject: x\r\nDate: not a date\r\n\r\n")
+    match mailmsg.parse(bad, 32)
+        Ok(m)  =>
+            match mailmsg.date_of(m)
+                Ok(d)  => test.fail("a date that is not one parsed")
+                Err(e) => test.assert_eq_str(mailerror.code(e), "bad-date")
+        Err(e) => test.fail(e.message())
+
+    let bad_id = bytes.from_str("Subject: x\r\nMessage-ID: nope\r\n\r\n")
+    match mailmsg.parse(bad_id, 32)
+        Ok(m)  =>
+            match mailmsg.message_id_of(m)
+                Ok(i)  => test.fail("an identifier that is not one parsed")
+                Err(e) => test.assert_eq_str(mailerror.code(e), "bad-message-id")
+        Err(e) => test.fail(e.message())
+
+    let bad_from = bytes.from_str("From: nope\r\n\r\n")
+    match mailmsg.parse(bad_from, 32)
+        Ok(m)  =>
+            match mailmsg.from_of(m)
+                Ok(a)  => test.fail("an address that is not one parsed")
+                Err(e) => test.assert_eq_str(mailerror.code(e), "bad-address")
+        Err(e) => test.fail(e.message())
+
+    let bad_to = bytes.from_str("To: nope\r\n\r\n")
+    match mailmsg.parse(bad_to, 32)
+        Ok(m)  =>
+            match mailmsg.recipients_of(m)
+                Ok(r)  => test.fail("an address that is not one parsed")
+                Err(e) => test.assert_eq_str(mailerror.code(e), "bad-address")
+        Err(e) => test.fail(e.message())
+
+    test.case("and the fields that are absent answer the empty answer")
+    let none = bytes.from_str("Subject: x\r\n\r\n")
+    match mailmsg.parse(none, 32)
+        Ok(m)  =>
+            test.assert(mailmsg.date_of(m)! == None)
+            test.assert(mailmsg.message_id_of(m)! == None)
+            test.assert_eq(list.len(mailmsg.thread_parents_of(m)!), 0)
+            test.assert_eq_str(mailmsg.text_of(m)!, "")
+            test.assert_eq_str(mailmsg.subject_of(m), "x")
+        Err(e) => test.fail(e.message())
+
+    test.case("a subject in a charset this package cannot convert is the raw value")
+    let odd = bytes.from_str("Subject: =?x-mac-ce?Q?a?=\r\n\r\n")
+    match mailmsg.parse(odd, 32)
+        Ok(m)  => test.assert_eq_str(mailmsg.subject_of(m), "=?x-mac-ce?Q?a?=")
+        Err(e) => test.fail(e.message())
+
+    test.case("an In-Reply-To is read when there is no References")
+    let reply = bytes.from_str("In-Reply-To: <p@y.z>\r\n\r\n")
+    match mailmsg.parse(reply, 32)
+        Ok(m)  => test.assert_eq(list.len(mailmsg.thread_parents_of(m)!), 1)
+        Err(e) => test.fail(e.message())
+
+    test.case("a message with no plain text part answers nothing at all")
+    let attached = bytes.from_str("Content-Type: application/octet-stream\r\n\r\n\x01\x02")
+    match mailmsg.parse(attached, 32)
+        Ok(m)  => test.assert_eq_str(mailmsg.text_of(m)!, "")
+        Err(e) => test.fail(e.message())

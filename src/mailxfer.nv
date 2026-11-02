@@ -41,6 +41,48 @@
 use mailctype
 use mailerror
 
+// ── Private helpers ──────────────────────────────────────────────────
+
+// The value a hexadecimal character denotes, or `-1`.
+fn hex_value(b: Int) -> Int
+    if b >= '0' and b <= '9'
+        return b - 48
+    if b >= 'A' and b <= 'F'
+        return b - 55
+    if b >= 'a' and b <= 'f'
+        return b - 87
+    -1
+
+// A hexadecimal character for a value in `0 ..= 15`, uppercase, as
+// RFC 2045 § 6.7 rule 2 requires on the way out.
+fn hex_char(v: Int) -> Str
+    let d = v % 16
+    if d < 10
+        return str.from_byte(48 + d)
+    str.from_byte(55 + d)
+
+// Whether an octet ends a line.
+fn line_break(b: Int) -> Bool
+    b == '\r' or b == '\n'
+
+// Whether the space or tab at `i` is the last thing on its line, which
+// RFC 2045 § 6.7 rule 3 requires to be encoded so that a mail path
+// cannot strip it.
+fn trailing_space(data: Bytes, i: Int) -> Bool
+    if i + 1 >= bytes.len(data)
+        return true
+    line_break(bytes.byte_at(data, i + 1) ?? 0)
+
+// Whether an octet is one base64 carries.
+fn base64_byte(b: Int) -> Bool
+    if b >= 'A' and b <= 'Z'
+        return true
+    if b >= 'a' and b <= 'z'
+        return true
+    if b >= '0' and b <= '9'
+        return true
+    b == '+' or b == '/' or b == '='
+
 // A range of octets in a message's bytes: where a body part is,
 // without copying it.
 //
@@ -69,7 +111,7 @@ pub struct MailSpan
 //     println("${mailxfer.span(0, 0).start}")           // 0
 // ```
 pub fn span(start: Int, len: Int) -> MailSpan
-    todo("mail-nv.mailxfer.span")
+    MailSpan { start: start, len: len }
 
 // The octets a span names, copied out of the source.
 //
@@ -86,7 +128,9 @@ pub fn span(start: Int, len: Int) -> MailSpan
 //         Err(e) => println(e.message())
 // ```
 pub fn slice(source: Bytes, s: MailSpan) -> Result<Bytes, mailerror.MailError>
-    todo("mail-nv.mailxfer.slice")
+    if s.start < 0 or s.len < 0 or s.start > bytes.len(source) or s.len > bytes.len(source) - s.start
+        return Err(MailSpanOutOfRange(s.start, s.len))
+    Ok(bytes.slice(source, s.start, s.start + s.len))
 
 // A span decoded according to a transfer encoding.
 //
@@ -107,7 +151,10 @@ pub fn slice(source: Bytes, s: MailSpan) -> Result<Bytes, mailerror.MailError>
 // ```
 pub fn decode(source: Bytes, s: MailSpan,
               encoding: mailctype.MailTransferEncoding) -> Result<Bytes, mailerror.MailError>
-    todo("mail-nv.mailxfer.decode")
+    match encoding
+        MailQuotedPrintable => decode_quoted_printable(source, s)
+        MailBase64Encoding  => decode_base64(source, s)
+        _                   => slice(source, s)
 
 // Octets encoded according to a transfer encoding, with the line
 // length the mechanism requires.
@@ -120,7 +167,11 @@ pub fn decode(source: Bytes, s: MailSpan,
 //     println(mailxfer.encode(bytes.from_str("hi"), MailBase64Encoding))
 // ```
 pub fn encode(data: Bytes, encoding: mailctype.MailTransferEncoding) -> Str
-    todo("mail-nv.mailxfer.encode")
+    if encoding == MailQuotedPrintable
+        return encode_quoted_printable(data)
+    if encoding == MailBase64Encoding
+        return encode_base64(data)
+    bytes.to_str(data)
 
 // A quoted-printable body decoded, RFC 2045 § 6.7.
 //
@@ -140,7 +191,33 @@ pub fn encode(data: Bytes, encoding: mailctype.MailTransferEncoding) -> Str
 //         Err(e) => println(e.message())
 // ```
 pub fn decode_quoted_printable(source: Bytes, s: MailSpan) -> Result<Bytes, mailerror.MailError>
-    todo("mail-nv.mailxfer.decode_quoted_printable")
+    let data = slice(source, s)!
+    var out: [Int] = []
+    let n = bytes.len(data)
+    var i = 0
+    while i < n
+        let b = bytes.byte_at(data, i) ?? 0
+        if b != '='
+            list.push(out, b)
+            i = i + 1
+        elif i + 1 < n and line_break(bytes.byte_at(data, i + 1) ?? 0)
+            if (bytes.byte_at(data, i + 1) ?? 0) == '\r' and i + 2 < n
+                if (bytes.byte_at(data, i + 2) ?? 0) == '\n'
+                    i = i + 3
+                else
+                    i = i + 2
+            else
+                i = i + 2
+        elif i + 3 <= n and hex_value(bytes.byte_at(data, i + 1) ?? 0) >= 0
+            let hi = hex_value(bytes.byte_at(data, i + 1) ?? 0)
+            let lo = hex_value(bytes.byte_at(data, i + 2) ?? 0)
+            if lo < 0
+                return Err(MailBadQuotedPrintable(s.start + i))
+            list.push(out, hi * 16 + lo)
+            i = i + 3
+        else
+            return Err(MailBadQuotedPrintable(s.start + i))
+    Ok(bytes.from_byte_list(out))
 
 // Octets encoded as quoted-printable, with soft line breaks so that no
 // line exceeds 76 octets.
@@ -157,7 +234,46 @@ pub fn decode_quoted_printable(source: Bytes, s: MailSpan) -> Result<Bytes, mail
 //     println(mailxfer.encode_quoted_printable(bytes.from_str("hi")))
 // ```
 pub fn encode_quoted_printable(data: Bytes) -> Str
-    todo("mail-nv.mailxfer.encode_quoted_printable")
+    var out: [Str] = []
+    var line: [Str] = []
+    var used = 0
+    let n = bytes.len(data)
+    var i = 0
+    while i < n
+        let b = bytes.byte_at(data, i) ?? 0
+        if line_break(b)
+            list.push(line, str.from_byte(b))
+            if b == '\r' and i + 1 < n and (bytes.byte_at(data, i + 1) ?? 0) == '\n'
+                list.push(line, str.from_byte(10))
+                i = i + 2
+            else
+                i = i + 1
+            list.push(out, str.join(line, ""))
+            line = []
+            used = 0
+        else
+            var piece = ""
+            var must_encode = b == '=' or b < ' ' or b > '~'
+            if (b == ' ' or b == '\t') and trailing_space(data, i)
+                must_encode = true
+            if must_encode
+                piece = "=${hex_char(b / 16)}${hex_char(b)}"
+            else
+                piece = str.from_byte(b)
+            if used + str.len(piece) > 75
+                // § 6.7 rule 5: the soft break is the `=` and a
+                // CRLF.  Without the break the `=` becomes the start
+                // of an escape for whatever follows, and the body
+                // decodes to something else than what was encoded.
+                list.push(out, "${str.join(line, "")}=\r\n")
+                line = []
+                used = 0
+            list.push(line, piece)
+            used = used + str.len(piece)
+            i = i + 1
+    if list.len(line) > 0
+        list.push(out, str.join(line, ""))
+    str.join(out, "")
 
 // A base64 body decoded, RFC 2045 § 6.8.
 //
@@ -174,7 +290,20 @@ pub fn encode_quoted_printable(data: Bytes) -> Str
 //         Err(e) => println(e.message())
 // ```
 pub fn decode_base64(source: Bytes, s: MailSpan) -> Result<Bytes, mailerror.MailError>
-    todo("mail-nv.mailxfer.decode_base64")
+    let data = slice(source, s)!
+    var kept: [Str] = []
+    let n = bytes.len(data)
+    var i = 0
+    while i < n
+        let b = bytes.byte_at(data, i) ?? 0
+        if base64_byte(b)
+            list.push(kept, str.from_byte(b))
+        elif not (b == ' ' or b == '\t' or line_break(b))
+            return Err(MailBadBase64(s.start + i))
+        i = i + 1
+    match bytes.from_base64(str.join(kept, ""))
+        Some(b) => Ok(b)
+        None    => Err(MailBadBase64(s.start))
 
 // Octets encoded as base64, wrapped at 76 characters per line.
 //
@@ -189,7 +318,17 @@ pub fn decode_base64(source: Bytes, s: MailSpan) -> Result<Bytes, mailerror.Mail
 //     println(mailxfer.encode_base64(bytes.from_str("hi")))    // aGk=
 // ```
 pub fn encode_base64(data: Bytes) -> Str
-    todo("mail-nv.mailxfer.encode_base64")
+    let text = bytes.to_base64(data)
+    let n = str.len(text)
+    var lines: [Str] = []
+    var i = 0
+    while i < n
+        var stop = i + 76
+        if stop > n
+            stop = n
+        list.push(lines, str.slice(text, i, stop))
+        i = stop
+    str.join(lines, "\r\n")
 
 // The transfer encoding that would be chosen for these octets: `7bit`
 // when they are already ASCII with short lines, `quoted-printable`
@@ -207,7 +346,31 @@ pub fn encode_base64(data: Bytes) -> Str
 //     println(mailctype.transfer_encoding_name(mailxfer.choose_encoding(bytes.from_str("hello"))))
 // ```
 pub fn choose_encoding(data: Bytes) -> mailctype.MailTransferEncoding
-    todo("mail-nv.mailxfer.choose_encoding")
+    let n = bytes.len(data)
+    var readable = 0
+    var seven = true
+    var run = 0
+    var i = 0
+    while i < n
+        let b = bytes.byte_at(data, i) ?? 0
+        if b >= ' ' and b <= '~'
+            readable = readable + 1
+        elif not line_break(b) and b != '\t'
+            seven = false
+        if b >= 128
+            seven = false
+        if line_break(b)
+            run = 0
+        else
+            run = run + 1
+            if run > 998
+                seven = false
+        i = i + 1
+    if seven
+        return MailSevenBit
+    if readable * 5 >= n * 4
+        return MailQuotedPrintable
+    MailBase64Encoding
 
 // Octets with every line ending converted to CRLF, the canonical form
 // RFC 2045 § 6.7 requires before a `text/*` body is encoded.
@@ -223,7 +386,24 @@ pub fn choose_encoding(data: Bytes) -> mailctype.MailTransferEncoding
 //     println("${bytes.len(mailxfer.to_crlf(bytes.from_str("a\nb")))}")   // 4
 // ```
 pub fn to_crlf(data: Bytes) -> Bytes
-    todo("mail-nv.mailxfer.to_crlf")
+    var out: [Int] = []
+    let n = bytes.len(data)
+    var i = 0
+    while i < n
+        let b = bytes.byte_at(data, i) ?? 0
+        match b
+            13 if i + 1 < n and (bytes.byte_at(data, i + 1) ?? 0) == '\n' =>
+                list.push(out, 13)
+                list.push(out, 10)
+                i = i + 2
+            _ if line_break(b)                                            =>
+                list.push(out, 13)
+                list.push(out, 10)
+                i = i + 1
+            _                                                             =>
+                list.push(out, b)
+                i = i + 1
+    bytes.from_byte_list(out)
 
 // Octets with every CRLF converted to a single LF, for a caller that
 // wants text rather than wire octets.
@@ -240,4 +420,19 @@ pub fn to_crlf(data: Bytes) -> Bytes
 //     println("${bytes.len(mailxfer.to_lf(bytes.from_str("a\r\nb")))}")   // 3
 // ```
 pub fn to_lf(data: Bytes) -> Bytes
-    todo("mail-nv.mailxfer.to_lf")
+    var out: [Int] = []
+    let n = bytes.len(data)
+    var i = 0
+    while i < n
+        let b = bytes.byte_at(data, i) ?? 0
+        match b
+            13 if i + 1 < n and (bytes.byte_at(data, i + 1) ?? 0) == '\n' =>
+                list.push(out, 10)
+                i = i + 2
+            _ if line_break(b)                                            =>
+                list.push(out, 10)
+                i = i + 1
+            _                                                             =>
+                list.push(out, b)
+                i = i + 1
+    bytes.from_byte_list(out)

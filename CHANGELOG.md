@@ -5,6 +5,130 @@ All notable changes to mail-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## Unreleased
+
+### Changed
+
+- Internal: ladders rewritten as `match` with character literals, the date token kind is an enum, and errors are propagated with `!`. No public signature changed.
+
+### Fixed
+
+- `mailxfer.slice` refuses a span that reaches past the source, for a start and a length of any size.
+
+## 0.1.0 — 2026-10-13
+
+**The implementation, over the 0.0.2 interface.** Every public function
+declared in the interface release has a body; the signatures, the
+effect rows and the doc comments are unchanged. The version moves off
+`0.0.x`, which is where an interface release lives, and the stability
+moves from `draft` to `experimental`.
+
+### Added
+
+- Every body in all eight modules. `novo test tests` runs eight
+  suites, 143 cases, green: the five interface suites plus the three
+  landing suites below. `novo pkg publish` reports 99% of 2036
+  instrumented lines under `src/` covered, with the ten remaining
+  regions excused by `// cov: skip` and the reason on each.
+- `tests/mail_nv_edge_tests.nv` — the four rules the rest of the
+  grammar leans on, pinned from raw octets rather than from values the
+  package made itself: a folded subject and a folded address list; a
+  comma inside a quoted display name and a parenthesised comment,
+  neither of which is a separator or a name; a `Date:` with a named
+  zone and one with a two-digit year; and a message with no body at
+  all, beside one whose body's first line looks like a header field.
+- `tests/mail_nv_gap_tests.nv` — the corner of every module that the
+  interface suites reach past: the obsolete zone table and the military
+  letters, the RFC 2231 sections a long parameter is cut into, the
+  transfer encodings' refusals, the multipart tree's span arithmetic,
+  and the folding every field goes through.
+- `tests/mail_nv_cover_tests.nv` — the publish coverage residual: the
+  refusal each parser has for a shape the interface suites do not
+  produce (a bad angle address naming its offset, an unclosed group, a
+  part whose headers overrun its content, a word whose marker is
+  malformed), the paths a builder takes for an empty name or an empty
+  value, and the round trips that keep them honest.
+
+### Fixed
+
+- `mailword.percent_encode` wrote `=XX` where RFC 2231 § 4 requires
+  `%XX`. A `boundary*0*` parameter written by the builders came back as
+  a boundary containing `=3D`, so a message this package built could
+  not be parsed back by this package. Caught by the round-trip case in
+  `tests/mailmsg_tests.nv`.
+- `mailword.encode_q_bytes` and `mailxfer.encode_quoted_printable`
+  wrote `%{...}` where the interpolation syntax of the language is
+  `${...}`, so those code paths emitted the literal text `%{` and the
+  hexadecimal digits were never substituted.
+- `mailword.utf8_to_latin1` substituted one `?` for a four-octet
+  character and advanced by one octet, so the continuation octets were
+  read again as leads and the word came out three octets long with a
+  byte packed from a negative integer (`\u{1f600}` encoded as
+  `=?iso-8859-1?B?P9g/?=` where the rule is one `?`). Filed as
+  `novo/bugs/diagnostics/closed/mail-nv-utf8-to-latin1-re-reads-a-four-octet-character-s-continuation-octets`.
+- `mailword.word_end` answered at the `?` that closes an encoded
+  word's charset instead of at the `?=` that closes the word, so every
+  well-formed word was cut to `=?charset?` and decoded to its own
+  literal text — and a word whose text was really malformed became
+  indistinguishable from one this package had cut short itself. Filed
+  as
+  `novo/bugs/diagnostics/closed/mail-nv-word-end-answers-at-the-charset-s-question-mark`.
+- `mailhdr.zone_offset` gave the military letters `K`, `L` and `M` an
+  hour too many (`(letter - 96)` where RFC 5322 § 4.3's skipped `J`
+  makes `K` the tenth hour), so such a date was placed an hour early.
+  Filed as
+  `novo/bugs/diagnostics/closed/mail-nv-zone-offset-gives-the-military-letters-k-l-and-m-an-hour-too-many`.
+- `mailxfer.encode_quoted_printable` wrote the soft line break as a
+  bare `=`, not RFC 2045 § 6.7 rule 5's `=` and CRLF, so a wrapped
+  body decoded one octet short — through this package's own decoder as
+  well as anyone else's. Filed as
+  `novo/bugs/diagnostics/closed/mail-nv-encode-quoted-printable-s-soft-break-is-a-bare-equals-sign`.
+- `mailaddr.parse_entries` accepted a group whose `;` never arrived
+  (`"Friends: x@y.z, "` parsed as a complete field), where RFC 5322
+  § 3.4 ends a group with the semicolon. Filed as
+  `novo/bugs/diagnostics/closed/mail-nv-parse-entries-accepts-a-group-whose-semicolon-never-arrives`.
+
+### Known
+
+- **The obsolete zone names are read and never written.** RFC 5322
+  § 4.3's alphabetic zones and military letters are accepted and
+  converted to an offset, and `format_date` always writes the numeric
+  form § 3.3 specifies. A round trip through this package therefore
+  does not preserve `GMT` as written, which is the intent and is pinned
+  by `tests/mail_nv_edge_tests.nv`.
+- **A two-digit year is windowed at 50.** `< 50` reads as `20xx` and
+  `>= 50` as `19xx`, which is every implementation's rule and is a
+  guess about a year that was never written down.
+- **Three character sets are converted**: `us-ascii`, `iso-8859-1` and
+  `utf-8`. Everything else is `MailUnknownCharset`, and
+  `mailerror.is_unrenderable` says it is a rendering limit rather than
+  a malformed message.
+- **`MailError` carries eighteen reasons**, which the 0.0.1 and 0.0.2
+  entries described as twenty. The type has not changed; the count in
+  that prose was wrong.
+- **No dependency on smtp-nv or dkim-nv**, as the interface release
+  said. Both depend on this package rather than the other way round.
+- **The effect row never widened.** Every function fits `core`'s empty
+  budget, and `novo`'s floor moves to `>= 0.20.2`, the toolchain the
+  bodies were verified against.
+
+### Workarounds recorded here
+
+- **An early return leaves a call-bound local live, and the local is
+  what the tail moves, so the reference is stranded**
+  (`memory-perceus/an-early-return-skips-the-release-of-a-call-bound-local-the-tail-moves`,
+  closed, `fixed_in: 0.20.3`). `mailctype.parse_content_type` answered
+  `Ok` with two `str.slice` results built in the literal the tail
+  moves; under novo 0.20.2 the refusals above them stranded the
+  intermediate and the suite exited 23 with every verdict green. The
+  two names are now cut out of `value` only after the last refusal, so
+  every path that returns early does so before the first call whose
+  result the tail moves; the comment at the site in
+  `src/mailctype.nv` names this filing. 0.20.3 is **not** the toolchain
+  here — the manifest's floor is `>= 0.20.2`, which still strands it,
+  so the shape stays. **Revert when the floor moves past 0.20.2 and the
+  leak no longer reproduces.**
+
 ## 0.0.2 — 2026-09-28
 
 The dependency ranges move to the dependencies' current releases.  A

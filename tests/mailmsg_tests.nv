@@ -1,8 +1,5 @@
 // mailmsg_tests.nv — a whole message read, and a whole message built.
 //
-// RED ON PURPOSE: every assertion reaches `not implemented:
-// mail-nv.mailmsg.<fn>`.
-//
 // THE PROPERTY THIS SUITE IS FOR is the round trip: a draft built here
 // and parsed back gives the same addresses, the same subject and the
 // same attachment octets.  Everything else in the file is a fact the

@@ -30,6 +30,330 @@
 // raw UTF-8 in a header.
 
 use mailerror
+use mailword
+
+// ── Private helpers ──────────────────────────────────────────────────
+
+// Whether an octet may appear in an `atext` (RFC 5322 § 3.2.3).
+fn atext_byte(b: Int) -> Bool
+    if b >= 'A' and b <= 'Z'
+        return true
+    if b >= 'a' and b <= 'z'
+        return true
+    if b >= '0' and b <= '9'
+        return true
+    b == '!' or b == '#' or b == '$' or b == '%' or b == '&' or b == '\''
+        or b == '*' or b == '+' or b == '-' or b == '/' or b == '=' or b == '?'
+        or b == '^' or b == '_' or b == '`' or b == '{' or b == '|' or b == '}'
+        or b == '~'
+
+// Whether an octet may appear unquoted in a `phrase`.  RFC 5322 § 3.2.3
+// excludes `specials`, but the obsolete grammar allows a dot inside a
+// phrase and every mail client writes "John Q. Public" unquoted.
+fn phrase_byte(b: Int) -> Bool
+    atext_byte(b) or b == ' ' or b == '\t' or b == '.'
+
+// Whether an octet may appear in a domain: a letter, a digit or a
+// hyphen, or the dot between labels.
+fn domain_byte(b: Int) -> Bool
+    if b >= 'A' and b <= 'Z'
+        return true
+    if b >= 'a' and b <= 'z'
+        return true
+    if b >= '0' and b <= '9'
+        return true
+    b == '-' or b == '.'
+
+// The text with every fold removed: the CRLF goes and the whitespace
+// that followed it is what separates the words.
+fn unfolded(text: Str) -> Str
+    var out: [Str] = []
+    let n = str.len(text)
+    var i = 0
+    while i < n
+        let b = str.byte_at_or(text, i, 0)
+        if b != '\r' and b != '\n'
+            list.push(out, str.slice(text, i, i + 1))
+        i = i + 1
+    str.join(out, "")
+
+// The text with every comment removed.  A comment becomes one space,
+// because RFC 5322 § 3.2.2 puts it where whitespace may go — and one
+// inside a quoted string is not a comment at all, which is why the
+// quote state is tracked.
+fn uncommented(text: Str) -> Str
+    var out: [Str] = []
+    let n = str.len(text)
+    var i = 0
+    var in_quotes = false
+    while i < n
+        let b = str.byte_at_or(text, i, 0)
+        match b
+            _ if in_quotes =>
+                list.push(out, str.slice(text, i, i + 1))
+                if b == '\\' and i + 1 < n
+                    list.push(out, str.slice(text, i + 1, i + 2))
+                    i = i + 2
+                else
+                    if b == '"'
+                        in_quotes = false
+                    i = i + 1
+            34             =>
+                in_quotes = true
+                list.push(out, "\"")
+                i = i + 1
+            40             =>
+                var depth = 1
+                i = i + 1
+                while i < n and depth > 0
+                    let c = str.byte_at_or(text, i, 0)
+                    if c == '\\'
+                        i = i + 2
+                    else
+                        if c == '('
+                            depth = depth + 1
+                        elif c == ')'
+                            depth = depth - 1
+                        i = i + 1
+                list.push(out, " ")
+            _              =>
+                list.push(out, str.slice(text, i, i + 1))
+                i = i + 1
+    str.join(out, "")
+
+// The offset just past the quoted string that opens at `from`.
+fn quoted_end(s: Str, from: Int) -> Int
+    let n = str.len(s)
+    var i = from + 1
+    while i < n
+        let b = str.byte_at_or(s, i, 0)
+        match b
+            92 =>
+                i = i + 2
+            34 =>
+                return i + 1
+            _  =>
+                i = i + 1
+    n
+
+// The offset of the next `,` or `;` outside a quoted string and outside
+// an angle-bracketed address — and of the next `:` too when the caller
+// is looking for the start of a group.
+fn scan_top(s: Str, from: Int, at_colon: Bool) -> Int
+    let n = str.len(s)
+    var i = from
+    while i < n
+        let b = str.byte_at_or(s, i, 0)
+        match b
+            34             =>
+                i = quoted_end(s, i)
+            60             =>
+                let close = str.index_from(s, ">", i + 1)
+                i = close ?? n
+            44 | 59        =>
+                return i
+            58 if at_colon =>
+                return i
+            _              =>
+                i = i + 1
+    n
+
+// The offset of the next octet that is not whitespace.
+fn skip_fws(s: Str, from: Int) -> Int
+    let n = str.len(s)
+    var i = from
+    while i < n
+        let b = str.byte_at_or(s, i, 0)
+        if b != ' ' and b != '\t'
+            break
+        i = i + 1
+    i
+
+// The text with every backslash escape resolved.
+fn unescape(text: Str) -> Str
+    var out: [Str] = []
+    let n = str.len(text)
+    var i = 0
+    while i < n
+        let b = str.byte_at_or(text, i, 0)
+        if b == '\\' and i + 1 < n
+            list.push(out, str.slice(text, i + 1, i + 2))
+            i = i + 2
+        else
+            list.push(out, str.slice(text, i, i + 1))
+            i = i + 1
+    str.join(out, "")
+
+// A display name, with its quoting removed and its encoded words
+// decoded.
+fn name_text(chunk: Str) -> Result<Str, mailerror.MailError>
+    let t = str.trim(chunk)
+    var text = t
+    if str.len(t) >= 2 and str.byte_at_or(t, 0, 0) == '"'
+        if str.byte_at_or(t, str.len(t) - 1, 0) == '"'
+            text = unescape(str.slice(t, 1, str.len(t) - 1))
+    let s = mailword.decode_phrase(text)!
+    Ok(str.trim(s))
+
+// The offset of the single `@` outside a quoted string, or `-1` when
+// there is none or more than one.
+fn at_split(t: Str) -> Int
+    let n = str.len(t)
+    var i = 0
+    var found = -1
+    while i < n
+        let b = str.byte_at_or(t, i, 0)
+        match b
+            34 =>
+                i = quoted_end(t, i)
+            64 =>
+                if found >= 0
+                    return -1
+                found = i
+                i = i + 1
+            _  =>
+                i = i + 1
+    found
+
+// A local part with its quoting removed.
+fn local_text(part: Str) -> Str
+    let t = str.trim(part)
+    if str.len(t) >= 2 and str.byte_at_or(t, 0, 0) == '"'
+        if str.byte_at_or(t, str.len(t) - 1, 0) == '"'
+            return unescape(str.slice(t, 1, str.len(t) - 1))
+    t
+
+// An address specification, with no display name.  The domain is
+// lowercased, because RFC 5321 § 2.4 makes it case-insensitive and no
+// caller wants to write that fold itself.
+fn address_of(spec: Str, offset: Int) -> Result<MailAddress, mailerror.MailError>
+    let t = str.trim(spec)
+    let split = at_split(t)
+    if split < 0
+        return Err(MailBadAddress(offset, "not a single at sign"))
+    let local = local_text(str.slice(t, 0, split))
+    let domain = str.lower(str.trim(str.slice(t, split + 1, str.len(t))))
+    if local == ""
+        return Err(MailBadAddress(offset, "the local part is empty"))
+    if domain == ""
+        return Err(MailBadAddress(offset, "the domain is empty"))
+    Ok(MailAddress { display_name: "", local_part: local, domain: domain })
+
+// One `mailbox`: either `Name <local@domain>` or a bare `addr-spec`.
+fn parse_mailbox_chunk(chunk: Str, offset: Int) -> Result<MailAddress, mailerror.MailError>
+    let t = str.trim(chunk)
+    if t == ""
+        return Err(MailBadAddress(offset, "an address is missing"))
+    let open_opt = str.index(t, "<")
+    if open_opt == None
+        return address_of(t, offset)
+    let open = open_opt ?? 0
+    let close_opt = str.index_from(t, ">", open + 1)
+    if close_opt == None
+        return Err(MailBadAddress(offset + open, "the angle address is not closed"))
+    let close = close_opt ?? str.len(t)
+    let name = name_text(str.slice(t, 0, open))!
+    let inner = address_of(str.slice(t, open + 1, close), offset + open + 1)!
+    Ok(MailAddress { display_name: name, local_part: inner.local_part, domain: inner.domain })
+
+// Whether a local part may be written without quoting.
+fn local_is_bare(s: Str) -> Bool
+    let n = str.len(s)
+    if n == 0
+        return false
+    if str.byte_at_or(s, 0, 0) == '.' or str.byte_at_or(s, n - 1, 0) == '.'
+        return false
+    var i = 0
+    var dots = 0
+    while i < n
+        let b = str.byte_at_or(s, i, 0)
+        if b == '.'
+            dots = dots + 1
+            if dots > 1
+                return false
+        else
+            dots = 0
+            if not atext_byte(b)
+                return false
+        i = i + 1
+    true
+
+// Whether a domain is a dot-atom or a domain literal.
+fn domain_ok(s: Str) -> Bool
+    let n = str.len(s)
+    if n == 0
+        // cov: skip — the only caller refuses an empty domain first; flipping this line to `return true` leaves all 143 cases green, so the line is unreachable and not merely untested
+        return false
+    if str.byte_at_or(s, 0, 0) == '['
+        return n >= 3 and str.byte_at_or(s, n - 1, 0) == ']'
+    if str.byte_at_or(s, 0, 0) == '.' or str.byte_at_or(s, n - 1, 0) == '.'
+        return false
+    var i = 0
+    var dots = 0
+    while i < n
+        let b = str.byte_at_or(s, i, 0)
+        if b == '.'
+            dots = dots + 1
+            if dots > 1
+                return false
+        else
+            dots = 0
+            if not domain_byte(b)
+                return false
+        i = i + 1
+    true
+
+// A phrase written back: encoded when it is not ASCII, and quoted when
+// it holds an octet a `phrase` may not carry unquoted.
+fn phrase_out(text: Str) -> Str
+    if text == ""
+        return text
+    if mailword.needs_encoding(text)
+        return mailword.encode_text(text, MailUtf8)
+    var i = 0
+    var plain = true
+    while i < str.len(text)
+        if not phrase_byte(str.byte_at_or(text, i, 0))
+            plain = false
+            break
+        i = i + 1
+    if plain
+        return text
+    quoted_string(text)
+
+// Text as a quoted string: wrapped, with `"` and `\` escaped.
+fn quoted_string(text: Str) -> Str
+    var out: [Str] = []
+    let n = str.len(text)
+    var i = 0
+    while i < n
+        let b = str.byte_at_or(text, i, 0)
+        if b == '"' or b == '\\'
+            list.push(out, "\\")
+        list.push(out, str.slice(text, i, i + 1))
+        i = i + 1
+    "\"${str.join(out, "")}\""
+
+// A group written back, with its semicolon.
+fn format_group(g: MailGroup) -> Str
+    let head = phrase_out(g.display_name)
+    if list.len(g.members) == 0
+        return "${head}:;"
+    var parts: [Str] = []
+    for m in g.members
+        list.push(parts, format_address(m))
+    "${head}: ${str.join(parts, ", ")};"
+
+// One entry written back.
+fn format_entry(e: MailEntry) -> Str
+    match e
+        MailMailbox(m) => format_address(m)
+        MailGroupOf(g) => format_group(g)
+
+// Every mailbox of a group appended to a list.
+fn gather_mailboxes(var out: [MailAddress], g: MailGroup)
+    for m in g.members
+        list.push(out, m)
 
 // One mailbox: an optional display name and an address specification.
 //
@@ -105,7 +429,7 @@ pub enum MailEntry
 //     println(mailaddr.format_address(mailaddr.addr_spec("ada", "example.com")))
 // ```
 pub fn addr_spec(local_part: Str, domain: Str) -> MailAddress
-    todo("mail-nv.mailaddr.addr_spec")
+    MailAddress { display_name: "", local_part: local_part, domain: str.lower(domain) }
 
 // An address with a display name.
 //
@@ -119,7 +443,10 @@ pub fn addr_spec(local_part: Str, domain: Str) -> MailAddress
 //     println(mailaddr.format_address(mailaddr.named_address("Ada", "ada", "example.com")))
 // ```
 pub fn named_address(display_name: Str, local_part: Str, domain: Str) -> MailAddress
-    todo("mail-nv.mailaddr.named_address")
+    MailAddress {
+        display_name: display_name,
+        local_part: local_part,
+        domain: str.lower(domain) }
 
 // A group of mailboxes under a name.
 //
@@ -130,7 +457,7 @@ pub fn named_address(display_name: Str, local_part: Str, domain: Str) -> MailAdd
 //     println(mailaddr.group("Undisclosed recipients", []).display_name)
 // ```
 pub fn group(display_name: Str, members: [MailAddress]) -> MailGroup
-    todo("mail-nv.mailaddr.group")
+    MailGroup { display_name: display_name, members: members }
 
 // The address written back as `local@domain`, with the local part
 // quoted if the grammar needs it.
@@ -147,7 +474,10 @@ pub fn group(display_name: Str, members: [MailAddress]) -> MailGroup
 //     println(mailaddr.format_addr_spec(mailaddr.addr_spec("ada", "example.com")))
 // ```
 pub fn format_addr_spec(a: MailAddress) -> Str
-    todo("mail-nv.mailaddr.format_addr_spec")
+    if local_is_bare(a.local_part)
+        "${a.local_part}@${a.domain}"
+    else
+        "${quoted_string(a.local_part)}@${a.domain}"
 
 // The address written back as a `mailbox`: `Name <local@domain>`, or
 // just `local@domain` when there is no display name.
@@ -162,7 +492,9 @@ pub fn format_addr_spec(a: MailAddress) -> Str
 //     println(mailaddr.format_address(mailaddr.named_address("Ada", "ada", "example.com")))
 // ```
 pub fn format_address(a: MailAddress) -> Str
-    todo("mail-nv.mailaddr.format_address")
+    if a.display_name == ""
+        return format_addr_spec(a)
+    "${phrase_out(a.display_name)} <${format_addr_spec(a)}>"
 
 // A whole address field's value, written back, folded to fit the 78
 // octet line RFC 5322 § 2.1.1 recommends.
@@ -179,7 +511,20 @@ pub fn format_address(a: MailAddress) -> Str
 //     println(mailaddr.format_entries([one]))
 // ```
 pub fn format_entries(entries: [MailEntry]) -> Str
-    todo("mail-nv.mailaddr.format_entries")
+    var parts: [Str] = []
+    var used = 0
+    for i in 0..list.len(entries)
+        let piece = format_entry(entries[i])
+        if i > 0
+            if used + 2 + str.len(piece) > 78
+                list.push(parts, ",\r\n ")
+                used = 1
+            else
+                list.push(parts, ", ")
+                used = used + 2
+        list.push(parts, piece)
+        used = used + str.len(piece)
+    str.join(parts, "")
 
 // One address parsed from the text of a field.
 //
@@ -196,7 +541,12 @@ pub fn format_entries(entries: [MailEntry]) -> Str
 //         Err(e) => println(e.message())
 // ```
 pub fn parse_address(text: Str) -> Result<MailAddress, mailerror.MailError>
-    todo("mail-nv.mailaddr.parse_address")
+    let entries = parse_entries(text)!
+    if list.len(entries) != 1
+        return Err(MailBadAddress(0, "this is an address list, not one mailbox"))
+    match entries[0]
+        MailMailbox(m) => Ok(m)
+        MailGroupOf(_) => Err(MailBadAddress(0, "a group is not a mailbox"))
 
 // A whole address field's value parsed: mailboxes and groups, in the
 // order they were written.
@@ -214,7 +564,55 @@ pub fn parse_address(text: Str) -> Result<MailAddress, mailerror.MailError>
 //         Err(e) => println(e.message())
 // ```
 pub fn parse_entries(text: Str) -> Result<[MailEntry], mailerror.MailError>
-    todo("mail-nv.mailaddr.parse_entries")
+    let s = uncommented(unfolded(text))
+    let n = str.len(s)
+    var entries: [MailEntry] = []
+    var at = 0
+    while at < n
+        at = skip_fws(s, at)
+        if at >= n
+            break
+        let stop = scan_top(s, at, true)
+        if str.byte_at_or(s, stop, 0) == ':'
+            let name = name_text(str.slice(s, at, stop))!
+            at = stop + 1
+            var members: [MailAddress] = []
+            var closed = false
+            while at < n and not closed
+                at = skip_fws(s, at)
+                if at >= n
+                    break
+                let b = str.byte_at_or(s, at, 0)
+                match b
+                    59 =>
+                        at = at + 1
+                        closed = true
+                    44 =>
+                        at = at + 1
+                    _  =>
+                        let mstop = scan_top(s, at, false)
+                        let m = parse_mailbox_chunk(str.slice(s, at, mstop), at)!
+                        list.push(members, m)
+                        at = mstop
+            // RFC 5322 § 3.4 ends a group with `;`.  A member list that
+            // runs to the end of the field without one is not a group
+            // that happens to lack punctuation: what was written is
+            // not what would be read back.
+            if not closed
+                return Err(MailBadAddress(at, "the group is not closed"))
+            list.push(entries, MailGroupOf(group(name, members)))
+        else
+            let m = parse_mailbox_chunk(str.slice(s, at, stop), at)!
+            list.push(entries, MailMailbox(m))
+            at = stop
+        at = skip_fws(s, at)
+        if at < n
+            let b = str.byte_at_or(s, at, 0)
+            if b == ',' or b == ';'
+                at = at + 1
+            else
+                return Err(MailBadAddress(at, "an address is not followed by a comma"))
+    Ok(entries)
 
 // Every mailbox in a list of entries, with the groups flattened.
 //
@@ -229,7 +627,12 @@ pub fn parse_entries(text: Str) -> Result<[MailEntry], mailerror.MailError>
 //     println("${list.len(mailaddr.mailboxes_of([g]))}")    // 1
 // ```
 pub fn mailboxes_of(entries: [MailEntry]) -> [MailAddress]
-    todo("mail-nv.mailaddr.mailboxes_of")
+    var out: [MailAddress] = []
+    for e in entries
+        match e
+            MailMailbox(m) => list.push(out, m)
+            MailGroupOf(g) => gather_mailboxes(var out, g)
+    out
 
 // Whether a string is a syntactically valid `addr-spec` (RFC 5322
 // § 3.4.1).
@@ -245,7 +648,20 @@ pub fn mailboxes_of(entries: [MailEntry]) -> [MailAddress]
 //     println("${mailaddr.is_valid_addr_spec("ada@example.com")}")   // true
 // ```
 pub fn is_valid_addr_spec(text: Str) -> Bool
-    todo("mail-nv.mailaddr.is_valid_addr_spec")
+    let t = str.trim(text)
+    let split = at_split(t)
+    if split <= 0
+        return false
+    if split + 1 >= str.len(t)
+        return false
+    let local = str.slice(t, 0, split)
+    let domain = str.slice(t, split + 1, str.len(t))
+    if str.len(local) >= 2 and str.byte_at_or(local, 0, 0) == '"'
+        if str.byte_at_or(local, str.len(local) - 1, 0) != '"'
+            return false
+    elif not local_is_bare(local)
+        return false
+    domain_ok(domain)
 
 // Whether two addresses denote the same mailbox under RFC 5321 § 2.4:
 // the domains compared case-insensitively, the local parts compared
@@ -264,4 +680,4 @@ pub fn is_valid_addr_spec(text: Str) -> Bool
 //     println("${mailaddr.same_mailbox(a, b)}")   // true
 // ```
 pub fn same_mailbox(a: MailAddress, b: MailAddress) -> Bool
-    todo("mail-nv.mailaddr.same_mailbox")
+    a.local_part == b.local_part and str.lower(a.domain) == str.lower(b.domain)

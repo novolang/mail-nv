@@ -1,8 +1,5 @@
 // mailhdr_tests.nv — the header section: folding, order, and the field
 // bodies with a grammar.
-//
-// RED ON PURPOSE: every assertion reaches `not implemented:
-// mail-nv.mailhdr.<fn>`.
 
 use std.test
 use civil
@@ -136,6 +133,11 @@ fn test_an_obsolete_date_is_read_and_never_written() [io]
     test.case("and a field that is not a date-time at all is refused")
     match mailhdr.parse_date("yesterday")
         Ok(_)  => test.fail("`yesterday` is not a date-time")
+        Err(e) => test.assert(str.len(e.message()) > 0)
+
+    test.case("and a number after the seconds has no component left to be")
+    match mailhdr.parse_date("21 Nov 1997 09:55:06 123")
+        Ok(_)  => test.fail("a seventh bare number is not a date-time")
         Err(e) => test.assert(str.len(e.message()) > 0)
 
 @test

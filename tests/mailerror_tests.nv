@@ -1,8 +1,5 @@
 // mailerror_tests.nv — the refusals, and the two questions a caller
 // asks about one before deciding what to do with the message.
-//
-// RED ON PURPOSE: every assertion reaches `not implemented:
-// mail-nv.mailerror.<fn>`.
 
 use std.test
 use mailerror
