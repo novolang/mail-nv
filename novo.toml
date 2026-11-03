@@ -29,7 +29,7 @@ category    = "networking"
 tags        = ["email", "mime", "rfc-5322", "rfc-2045", "rfc-2047", "message", "smtp", "attachment"]
 repository  = "https://github.com/novolang/mail-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.20.2"
+novo        = ">= 0.23.0"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.
